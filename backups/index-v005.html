@@ -1,0 +1,1832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vision ANN/SNN Trainer (browser, v004 - real video)</title>
+<!--
+======================================================================
+VISION ANN/SNN TRAINER - BROWSER EDITION
+index-v004.html
+
+Companion to firmware-v004.ino (inference-only - the device never trains).
+Trains an ANN and an SNN classifier on this device's camera (webcam on
+iOS/Android/desktop via getUserMedia); weight files are byte-compatible
+with v002/v003's, so old myWeights.bin/mySnnWeights.bin still load - only
+the SNN's TRAINING DATA and LIVE INPUT changed (in v003), not its math or
+its file format.
+
+ARCHITECTURE (shared shape, different neuron model - unchanged from v002)
+  Conv1(3x3,4 filters) -> Pool(2x2 max) -> Conv2(3x3,8 filters) -> flatten -> Dense -> softmax
+  ANN: ordinary leaky-ReLU neurons, ordinary backprop + Adam. Trains on one
+       still frame per clip (the middle frame) - a single photo is still the
+       right input for "what is this", so the ANN pipeline is untouched.
+  SNN: every neuron above is a spiking LIF neuron, run for SNN_TIMESTEPS
+       steps, with a leaky per-class trace read off the flattened Conv2
+       spikes accumulating over all steps and softmaxed at the end -
+       exactly as in v002. Trained via surrogate-gradient backprop-through-
+       time across the timesteps - also exactly as in v002.
+
+REAL VIDEO, NOT SYNTHETIC TIMESTEPS (carried over from v003)
+  A "sample" is a short CLIP: SNN_TIMESTEPS real, sequential camera frames
+  captured CLIP_FRAME_INTERVAL_MS apart (see Collect: "Capture Clip" and
+  "Auto x5 Clips"). Timestep t of the SNN gets a fresh Bernoulli spike drawn
+  from REAL frame t of the clip, so the LIF membrane potentials integrate
+  genuine motion/change across real time - unlike v002, which re-rolled the
+  same still image every step. Live SNN inference keeps a rolling window of
+  the last SNN_TIMESTEPS real camera frames and re-classifies it on every
+  tick. A v004 clip and mySnnWeights.bin are NOT interchangeable with a
+  v002 one even though the file format matches byte-for-byte - the network
+  learned different assumptions about what changes between timesteps.
+
+WHAT CHANGED IN v004 - THE FIRMWARE NOW READS config.json ITSELF
+  firmware-v004.ino no longer has any of this file's settings baked in as
+  #defines to hand-copy. On boot it reads /header/config.json straight off
+  the SD card - classes, INPUT_SIZE, NUM_CHANNELS, SNN_TIMESTEPS, the LIF
+  params, CLIP_FRAME_INTERVAL_MS - and sizes its own buffers to match, for
+  however many classes you defined. Get config.json onto the card (Export
+  All (.zip) and copy it into place, or point "Choose Real Folder" straight
+  at the card if your computer can mount it) and the firmware picks it up
+  on the next boot - nothing to paste. The "Device settings" panel below is
+  now just a read-only summary of what's in config.json, for confirming the
+  device will see what you expect. The device can also collect its own
+  clips (menu items 1..N) straight to the SD card in the same clip_*/
+  folder layout this page writes, for when you're not near a laptop - but
+  it never trains; bring new clips back here and re-export the .bin files.
+
+INPUT_SIZE, NUM_CHANNELS (1=grayscale, 3=RGB), the number/names of classes,
+and SNN_TIMESTEPS (now also "frames per clip") are all adjustable here -
+changing any of them changes the model's size, so it resets both models to
+fresh weights (same as changing config.json and rebooting the device).
+
+SMALL FOLLOW-UP FIXES (still v004): a pulsing red dot next to the Collect
+title shows while a clip is actively recording (captureClipJpegs()), and a
+"View/Delete Clips" button in Collect shows a thumbnail grid of that class's
+clips with a per-clip delete button (Store.deleteClip()) - the thumbnail is
+each clip's middle frame.
+
+STORAGE: same pattern as the motion trainer - a real folder via the File
+System Access API where supported (Android Chrome/desktop Chrome), or
+in-browser IndexedDB with Export/Import (.zip) elsewhere (iOS Safari).
+Paths mirror the device's SD card: images/<class>/clip_<id>/f00.jpg...,
+header/myWeights.bin (ANN), header/mySnnWeights.bin (SNN), header/config.json.
+v002's flat images/<class>/img_*.jpg samples still import fine as single-
+frame "clips" (padded by repeating that frame) - see importEntry().
+
+By Jeremy Ellis, with Claude's help porting the CNN math to JavaScript and
+extending the SNN from synthetic timesteps to real video clips. Use at your
+own risk! MIT license.
+======================================================================
+-->
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222c; --text:#e8eaf0; --muted:#9aa3b2;
+    --accent:#4f8cff; --accent2:#2ecc71; --danger:#e74c3c; --warn:#f39c12; --border:#2a2f3a;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  #app{max-width:680px; margin:0 auto; padding:12px 12px 90px 12px;}
+  h1{font-size:1.15rem; margin:8px 0 2px 0;}
+  h2{font-size:0.95rem; margin:0 0 8px 0; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;}
+  p.small, .small{color:var(--muted); font-size:0.82rem; line-height:1.35;}
+  .card{background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:12px; margin-bottom:12px;}
+  .row{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+  button, .btn{
+    background:var(--panel2); color:var(--text); border:1px solid var(--border);
+    border-radius:10px; padding:10px 12px; font-size:0.95rem; cursor:pointer;
+    min-height:44px; touch-action:manipulation;
+  }
+  button:active{transform:scale(0.97);}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  button.good{background:var(--accent2); border-color:var(--accent2); color:#04240f;}
+  button.warn{background:var(--warn); border-color:var(--warn); color:#2b1900;}
+  button.danger{background:var(--danger); border-color:var(--danger); color:#fff;}
+  button:disabled{opacity:0.4; cursor:not-allowed;}
+  textarea{
+    width:100%; background:#0b0d12; color:#cde; border:1px solid var(--border); border-radius:10px;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:0.78rem; padding:8px;
+  }
+  #console{height:150px; resize:vertical;}
+  #deviceSettings{height:130px; resize:vertical;}
+  label{font-size:0.85rem; display:flex; align-items:center; gap:6px;}
+  input[type=number], input[type=text]{background:#0b0d12; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px;}
+  input[type=number]{width:80px;}
+  select{background:#0b0d12; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px;}
+  .settingsGrid{display:grid; grid-template-columns:1fr auto; gap:6px 12px; align-items:center;}
+  .badge{display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.72rem; background:var(--panel2); border:1px solid var(--border);}
+  .ok{color:var(--accent2);} .bad{color:var(--danger);} .mid{color:var(--warn);}
+  #stopBar{
+    position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px)) 12px;
+    background:linear-gradient(180deg, transparent, var(--bg) 30%); display:none; z-index:50;
+  }
+  #stopBar.show{display:block;}
+  #stopBar button{width:100%; font-size:1.05rem; padding:14px;}
+  progress{width:100%; height:10px; accent-color:var(--accent);}
+  hr{border:none; border-top:1px solid var(--border); margin:10px 0;}
+  .hidden{display:none !important;}
+  details summary{cursor:pointer; color:var(--muted); font-size:0.9rem; padding:4px 0;}
+  .classRow{display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px; background:var(--panel2); border-radius:10px; margin-bottom:6px;}
+  .classRow .name{font-weight:600; cursor:pointer; flex:1;}
+  .videoWrap{position:relative; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap;}
+  video{width:100%; max-width:280px; border-radius:12px; background:#000; aspect-ratio:1/1; object-fit:cover;}
+  canvas.heatmap{width:100%; max-width:280px; border-radius:12px; image-rendering:pixelated; background:#000;}
+  .predBanner{font-size:1.3rem; font-weight:700; text-align:center; padding:8px; border-radius:10px; background:var(--panel2); margin-top:8px;}  .recDot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--danger);margin-left:8px;vertical-align:middle;animation:recPulse 1s infinite;}
+  .recDot.hidden{display:none;}
+  @keyframes recPulse{0%,100%{opacity:1;}50%{opacity:0.25;}}
+  .galleryGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin-top:10px;}
+  .galleryGrid.hidden{display:none;}
+  .galleryItem{position:relative;background:var(--panel2);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+  .galleryItem img{display:block;width:100%;aspect-ratio:1;object-fit:cover;}
+  .galleryItem .cap{font-size:10px;color:var(--muted);padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .galleryItem .del{position:absolute;top:2px;right:2px;background:var(--danger);color:#fff;border:none;border-radius:50%;width:20px;height:20px;line-height:20px;text-align:center;cursor:pointer;font-size:13px;padding:0;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <h1>Vision ANN/SNN Trainer <span class="small">- browser edition, v004 (real video)</span></h1>
+  <p class="small">Trains both models on this device's camera. Companion to <b>firmware-v004.ino</b>, which
+  reads its class list and settings straight from config.json - no more copying #defines by hand.</p>
+
+  <div class="card" id="cameraCard">
+    <h2>Camera</h2>
+    <div class="videoWrap">
+      <video id="videoEl" autoplay muted playsinline></video>
+      <canvas id="heatmapCanvas" class="heatmap" width="64" height="64"></canvas>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button id="btnEnableCamera" class="primary">Enable Camera</button>
+      <button id="btnSwitchCamera">Switch Camera</button>
+    </div>
+    <p class="small" id="cameraStatus">Camera: <span class="bad">not enabled</span></p>
+    <div id="predBanner" class="predBanner hidden"></div>
+  </div>
+
+  <div class="card hidden" id="collectPanel">
+    <h2><span id="collectTitleText">Collect</span> <span id="recIndicator" class="recDot hidden" title="Recording..."></span></h2>
+    <p class="small" id="collectCount"></p>
+    <div class="row">
+      <button id="btnCaptureOne" class="primary">Capture Clip</button>
+      <button id="btnAutoCollect" class="good">Auto x5 Clips</button>
+      <label class="btn" for="fileImportImages" style="display:inline-flex;">Import Images&hellip;</label>
+      <input type="file" id="fileImportImages" accept="image/*" multiple class="hidden">
+      <button id="btnToggleGallery">View/Delete Clips</button>
+      <button id="btnDeleteClass" class="danger">Delete Class</button>
+      <button id="btnCloseCollect">Close</button>
+    </div>
+    <p class="small">A "clip" is <span id="clipFrameCountLabel"></span> real, sequential frames grabbed
+    a beat apart - hold the pose/motion steady (or moving, if that's the point) while it records. The
+    camera feed above stays live so you can see exactly what you're about to capture. "Import Images"
+    still works for single stills - each one becomes its own repeated-frame clip. The red dot above means
+    a clip is recording right now - don't move the camera or change the pose until it clears.</p>
+    <div id="galleryGrid" class="galleryGrid hidden"></div>
+  </div>
+
+  <div class="card" id="setupCard">
+    <h2>Resolution &amp; Storage</h2>
+    <div class="row">
+      <label>Size <input type="number" id="inpResolution" min="8" max="512" step="1"> px (square)</label>
+      <label><input type="checkbox" id="chkGrayscale"> Grayscale</label>
+      <button id="btnApplySettings" class="warn">Apply (resets both models)</button>
+    </div>
+    <p class="small">Any square size works - try 32, 64, 96, 128, 160... higher resolutions train slower (roughly with the square of the size) but may resolve finer detail; lower resolutions are much faster to iterate with, especially for the SNN.</p>
+    <hr>
+    <div class="row">
+      <button id="btnChooseFolder">Choose Real Folder&hellip;</button>
+      <button id="btnExportZip">Export All (.zip)</button>
+      <label class="btn" for="fileImportZip" style="display:inline-flex;">Import (.zip)</label>
+      <input type="file" id="fileImportZip" accept=".zip" class="hidden">
+    </div>
+    <p class="small" id="storageStatus">Storage: <span class="mid">in-browser (IndexedDB)</span> - use Export to get real files.</p>
+  </div>
+
+  <div class="card">
+    <h2>Classes <span class="small">(tap a name to collect)</span></h2>
+    <div id="classList"></div>
+    <div class="row" style="margin-top:6px;">
+      <input type="text" id="newClassName" placeholder="new class name">
+      <button id="btnAddClass" class="primary">+ Add Class</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Train &amp; Infer</h2>
+    <p class="small"><b>ANN</b></p>
+    <div class="row">
+      <button id="btnTrainAnn">Train</button>
+      <button id="btnAutoTrainAnn" class="warn">AutoTrain</button>
+      <button id="btnInferAnn">Infer (live)</button>
+    </div>
+    <p class="small" style="margin-top:8px;"><b>SNN</b></p>
+    <div class="row">
+      <button id="btnTrainSnn">Train</button>
+      <button id="btnAutoTrainSnn" class="warn">AutoTrain</button>
+      <button id="btnInferSnn">Infer (live)</button>
+    </div>
+    <div id="progressWrap" class="hidden" style="margin-top:8px;">
+      <p class="small" id="progressLabel"></p>
+      <progress id="progressBar" value="0" max="1"></progress>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label><input type="checkbox" id="chkVerbose" checked> Verbose logging</label>
+      <label><input type="checkbox" id="chkHeatmap" checked> Show heatmap</label>
+      <button id="btnStatus">Status</button>
+    </div>
+  </div>
+
+  <details class="card">
+    <summary>Model file transfer (to/from the device's SD card)</summary>
+    <div class="row" style="margin-top:8px;">
+      <button id="btnDownloadAnn">Download ANN weights</button>
+      <label class="btn" for="fileUploadAnn" style="display:inline-flex;">Upload ANN weights&hellip;</label>
+      <input type="file" id="fileUploadAnn" accept=".bin" class="hidden">
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button id="btnDownloadSnn">Download SNN weights</button>
+      <label class="btn" for="fileUploadSnn" style="display:inline-flex;">Upload SNN weights&hellip;</label>
+      <input type="file" id="fileUploadSnn" accept=".bin" class="hidden">
+    </div>
+    <p class="small">Filenames match the device exactly: myWeights.bin and mySnnWeights.bin, in the SD
+    card's /header/ folder. A weight file only loads if its size matches the CURRENT resolution/channels/
+    class count exactly - same safety check the device uses.</p>
+  </details>
+
+  <details class="card">
+    <summary>Freeze layers &amp; tunables</summary>
+    <div style="margin-top:8px;">
+      <div class="row">
+        <label><input type="checkbox" id="frzAnnC1"> ANN conv1</label>
+        <label><input type="checkbox" id="frzAnnC2"> ANN conv2</label>
+        <label><input type="checkbox" id="frzAnnOut"> ANN output</label>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <label><input type="checkbox" id="frzSnnC1"> SNN conv1</label>
+        <label><input type="checkbox" id="frzSnnC2"> SNN conv2</label>
+        <label><input type="checkbox" id="frzSnnOut"> SNN output</label>
+      </div>
+      <hr>
+      <div class="settingsGrid" id="settingsGrid"></div>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>Device settings (read automatically by firmware-v004.ino from config.json)</summary>
+    <p class="small">Nothing to paste - the firmware reads this straight from <code>/header/config.json</code>
+    on the SD card. This is just a summary to confirm the device will see what you expect.</p>
+    <textarea id="deviceSettings" readonly style="margin-top:8px;"></textarea>
+    <div class="row" style="margin-top:8px;"><button id="btnCopyDeviceSettings">Copy</button></div>
+  </details>
+
+  <div class="card">
+    <h2>Console</h2>
+    <textarea id="console" readonly></textarea>
+  </div>
+
+</div>
+
+<div id="stopBar"><button id="btnStop" class="danger">STOP</button></div>
+
+<script>
+'use strict';
+
+// ======================================================================
+// CONFIG - matches firmware-v004.ino (config.json values on the browser side). Kernel sizes and filter counts
+// are fixed (the device doesn't make those configurable); resolution,
+// channels, and the class list are all adjustable and change the model's
+// SIZE, so changing any of them rebuilds both models from scratch.
+// ======================================================================
+const CONV1_KERNEL = 3, CONV1_FILTERS = 4;
+const CONV2_KERNEL = 3, CONV2_FILTERS = 8;
+const CAPTURE_SIZE = 240;   // saved JPEGs are always this size, like the device's camera
+
+let INPUT_SIZE = 64;
+let NUM_CHANNELS = 3;       // 1 = grayscale, 3 = RGB
+let CLASSES = [];           // [{label, folder}]
+
+let LEARNING_RATE = 0.002;
+let BATCH_SIZE = 6;
+let TARGET_EPOCHS = 40;
+let VALIDATION_SAMPLES = 3;
+
+let SNN_TIMESTEPS = 16;      // also: real frames captured per clip
+let LIF_LEAK = 0.90;
+let LIF_THRESHOLD = 0.50;
+let SNN_TRACE_LEAK = 0.95;
+let CLIP_FRAME_INTERVAL_MS = 80; // gap between real frames within one clip
+
+const ANN_WEIGHT_FILE = 'myWeights.bin';
+const SNN_WEIGHT_FILE = 'mySnnWeights.bin';
+const CONFIG_FILE = 'config.json';
+
+let verboseInfer = true;
+let showHeatmap = true;
+let stopRequested = false;
+
+// ======================================================================
+// LOGGER / BUSY UI
+// ======================================================================
+function log(msg){
+  const el = document.getElementById('console');
+  el.value += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function setBusy(isBusy){
+  document.getElementById('stopBar').classList.toggle('show', isBusy);
+  document.querySelectorAll('.card button, details button').forEach(b=>{ if (b.id!=='btnStop') b.disabled = isBusy; });
+}
+function showProgress(show){ document.getElementById('progressWrap').classList.toggle('hidden', !show); }
+function updateTrainProgress(epoch, total, trainAcc, valAcc){
+  showProgress(true);
+  document.getElementById('progressBar').value = epoch/total;
+  document.getElementById('progressLabel').textContent =
+    `Epoch ${epoch}/${total}  Train ${trainAcc.toFixed(1)}%  Val ${valAcc.toFixed(1)}%`;
+}
+function sanitizeFolderName(label){
+  return label.replace(/[\/\\:*?"<>|]/g,'').trim().replace(/\s+/g,'_') || 'class';
+}
+
+// ======================================================================
+// STORAGE LAYER - File System Access API with an IndexedDB fallback.
+// Paths mirror the device's SD card: images/<folder>/*.jpg, header/*.bin,
+// header/config.json.
+// ======================================================================
+let _idbPromise = null;
+function idbOpen(){
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve,reject)=>{
+    const req = indexedDB.open('visionWebTrainer', 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore('kv'); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+  return _idbPromise;
+}
+async function idbGet(key){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readonly');
+    const rq = tx.objectStore('kv').get(key);
+    rq.onsuccess=()=>resolve(rq.result); rq.onerror=()=>reject(rq.error);
+  });
+}
+async function idbSet(key,val){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readwrite');
+    tx.objectStore('kv').put(val,key);
+    tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
+  });
+}
+async function idbDelete(key){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readwrite');
+    tx.objectStore('kv').delete(key);
+    tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
+  });
+}
+async function idbKeys(prefix){
+  const db = await idbOpen();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('kv','readonly');
+    const rq = tx.objectStore('kv').getAllKeys();
+    rq.onsuccess=()=>resolve(rq.result.filter(k=>typeof k==='string' && k.startsWith(prefix)));
+    rq.onerror=()=>reject(rq.error);
+  });
+}
+
+const Store = {
+  mode:'idb', rootHandle:null,
+  supportsFolder(){ return 'showDirectoryPicker' in window; },
+  async init(){
+    if (this.supportsFolder()){
+      try {
+        const saved = await idbGet('__fsRootHandle');
+        if (saved && saved.queryPermission){
+          const perm = await saved.queryPermission({mode:'readwrite'});
+          if (perm==='granted'){ this.rootHandle=saved; this.mode='fs'; }
+        }
+      } catch(e){}
+    }
+    this._reflectStatus();
+  },
+  async chooseFolder(){
+    if (!this.supportsFolder()){
+      alert("This browser can't grant a real folder (common on iPhone/iPad Safari). Using in-browser storage - use Export to get real files.");
+      return false;
+    }
+    try {
+      const handle = await window.showDirectoryPicker({id:'vision-training-data', mode:'readwrite'});
+      this.rootHandle = handle; this.mode = 'fs';
+      await idbSet('__fsRootHandle', handle);
+      this._reflectStatus();
+      log('Folder selected: '+handle.name);
+      return true;
+    } catch(e){ log('Folder selection cancelled.'); return false; }
+  },
+  _reflectStatus(){
+    const el = document.getElementById('storageStatus');
+    if (this.mode==='fs' && this.rootHandle) el.innerHTML = 'Storage: <span class="ok">real folder ('+this.rootHandle.name+')</span>';
+    else el.innerHTML = 'Storage: <span class="mid">in-browser (IndexedDB)</span> - use Export to get real files.';
+  },
+  async _classDir(classIdx, create){
+    const folder = CLASSES[classIdx].folder;
+    const images = await this.rootHandle.getDirectoryHandle('images', {create});
+    return images.getDirectoryHandle(folder, {create});
+  },
+  // A "sample" is now a CLIP: a small folder of sequentially-named real
+  // frames (clip_<id>/f00.jpg, f01.jpg, ...). A loose *.jpg sitting directly
+  // in the class folder (v002 layout, or a single imported still) still
+  // counts as one clip with a single frame - see listSamples() below.
+  async countSamples(classIdx){ return (await this.listSamples(classIdx)).length; },
+  async captureClip(classIdx, frameBlobs){
+    const clipId = `clip_${Date.now()}`;
+    if (this.mode==='fs' && this.rootHandle){
+      const dir = await this._classDir(classIdx, true);
+      const clipDir = await dir.getDirectoryHandle(clipId, {create:true});
+      for (let i=0;i<frameBlobs.length;i++){
+        const fh = await clipDir.getFileHandle(`f${String(i).padStart(2,'0')}.jpg`, {create:true});
+        const w = await fh.createWritable(); await w.write(frameBlobs[i]); await w.close();
+      }
+    } else {
+      for (let i=0;i<frameBlobs.length;i++){
+        await idbSet(`images/${CLASSES[classIdx].folder}/${clipId}/f${String(i).padStart(2,'0')}.jpg`, frameBlobs[i]);
+      }
+    }
+    return clipId;
+  },
+  async listSamples(classIdx){
+    // Returns [{ name: clipId, frames: [blob, blob, ...] }], frames in order.
+    const clips = new Map(); // clipId (or loose filename) -> array of {idx?, name, blob}
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const dir = await this._classDir(classIdx, false);
+        for await (const [name, h] of dir.entries()){
+          if (h.kind==='directory'){
+            const frames = [];
+            for await (const [fname, fh] of h.entries()){
+              if (/\.jpe?g$/i.test(fname)) frames.push({ name:fname, blob: await (await fh.getFile()) });
+            }
+            frames.sort((a,b)=>a.name.localeCompare(b.name));
+            if (frames.length) clips.set(name, frames.map(f=>f.blob));
+          } else if (/\.jpe?g$/i.test(name)){
+            clips.set(name, [await (await h.getFile())]); // v002 loose still
+          }
+        }
+      } catch(e){}
+    } else {
+      const prefix = 'images/'+CLASSES[classIdx].folder+'/';
+      const keys = await idbKeys(prefix);
+      const grouped = new Map();
+      for (const k of keys){
+        const rest = k.substring(prefix.length);
+        const slash = rest.indexOf('/');
+        if (slash>=0){
+          const clipId = rest.substring(0,slash), fname = rest.substring(slash+1);
+          if (!grouped.has(clipId)) grouped.set(clipId, []);
+          grouped.get(clipId).push({ name:fname, blob: await idbGet(k) });
+        } else {
+          grouped.set(rest, [{ name:rest, blob: await idbGet(k) }]); // v002 loose still
+        }
+      }
+      for (const [clipId, frames] of grouped){
+        frames.sort((a,b)=>a.name.localeCompare(b.name));
+        clips.set(clipId, frames.map(f=>f.blob));
+      }
+    }
+    return Array.from(clips, ([name, frames])=>({ name, frames }));
+  },
+  // Writes exactly at images/<class>/<relPath> (relPath may include a
+  // clip_x/ subfolder, or be a bare filename for a v002-style loose still).
+  // Used by zip import, which must preserve whatever grouping the zip had.
+  async writeImageAtPath(classIdx, relPath, blob){
+    if (this.mode==='fs' && this.rootHandle){
+      const dir = await this._classDir(classIdx, true);
+      const slash = relPath.indexOf('/');
+      let targetDir = dir, fname = relPath;
+      if (slash>=0){ targetDir = await dir.getDirectoryHandle(relPath.substring(0,slash), {create:true}); fname = relPath.substring(slash+1); }
+      const fh = await targetDir.getFileHandle(fname, {create:true});
+      const w = await fh.createWritable(); await w.write(blob); await w.close();
+    } else {
+      await idbSet(`images/${CLASSES[classIdx].folder}/${relPath}`, blob);
+    }
+  },
+  async deleteClassData(classIdx){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const images = await this.rootHandle.getDirectoryHandle('images', {create:false});
+        await images.removeEntry(CLASSES[classIdx].folder, {recursive:true});
+      } catch(e){}
+    } else {
+      const prefix = 'images/'+CLASSES[classIdx].folder+'/';
+      const keys = await idbKeys(prefix);
+      for (const k of keys) await idbDelete(k);
+    }
+  },
+  // Deletes ONE clip (clip.name from listSamples()) - either a clip_x/
+  // subfolder of frames, or a single loose v002-style still.
+  async deleteClip(classIdx, clipName){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const dir = await this._classDir(classIdx, false);
+        await dir.removeEntry(clipName, {recursive:true}); // works for both a subfolder and a lone file
+      } catch(e){}
+    } else {
+      const base = `images/${CLASSES[classIdx].folder}/${clipName}`;
+      await idbDelete(base); // loose still, if that's what this is
+      const nested = await idbKeys(base+'/');
+      for (const k of nested) await idbDelete(k); // clip subfolder's frames
+    }
+  },
+  async writeWeightFile(name, data){
+    if (this.mode==='fs' && this.rootHandle){
+      const hdr = await this.rootHandle.getDirectoryHandle('header', {create:true});
+      const fh = await hdr.getFileHandle(name, {create:true});
+      const w = await fh.createWritable();
+      await w.write(data); await w.close();
+    } else {
+      await idbSet('header/'+name, data);
+    }
+  },
+  async readWeightFile(name){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const hdr = await this.rootHandle.getDirectoryHandle('header', {create:false});
+        const fh = await hdr.getFileHandle(name, {create:false});
+        return await (await fh.getFile()).arrayBuffer();
+      } catch(e){ return null; }
+    } else {
+      const v = await idbGet('header/'+name);
+      if (!v) return null;
+      return (v instanceof Blob) ? await v.arrayBuffer() : v;
+    }
+  },
+  async readWeightFileText(name){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const hdr = await this.rootHandle.getDirectoryHandle('header', {create:false});
+        const fh = await hdr.getFileHandle(name, {create:false});
+        return await (await fh.getFile()).text();
+      } catch(e){ return null; }
+    } else {
+      const v = await idbGet('header/'+name);
+      if (!v) return null;
+      return (v instanceof Blob) ? await v.text() : v;
+    }
+  },
+};
+
+async function saveConfig(){
+  const cfg = { classes: CLASSES.map(c=>c.label), inputSize: INPUT_SIZE, numChannels: NUM_CHANNELS,
+                snnTimesteps: SNN_TIMESTEPS, lifLeak: LIF_LEAK, lifThreshold: LIF_THRESHOLD, snnTraceLeak: SNN_TRACE_LEAK,
+                clipFrameIntervalMs: CLIP_FRAME_INTERVAL_MS };
+  await Store.writeWeightFile(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
+async function loadConfig(){
+  const text = await Store.readWeightFileText(CONFIG_FILE);
+  if (!text) return false;
+  try {
+    const cfg = JSON.parse(text);
+    if (Array.isArray(cfg.classes)) CLASSES = cfg.classes.map(label=>({label, folder:sanitizeFolderName(label)}));
+    if (cfg.inputSize) INPUT_SIZE = cfg.inputSize;
+    if (cfg.numChannels) NUM_CHANNELS = cfg.numChannels;
+    if (cfg.snnTimesteps) SNN_TIMESTEPS = cfg.snnTimesteps;
+    if (cfg.lifLeak!==undefined) LIF_LEAK = cfg.lifLeak;
+    if (cfg.lifThreshold!==undefined) LIF_THRESHOLD = cfg.lifThreshold;
+    if (cfg.snnTraceLeak!==undefined) SNN_TRACE_LEAK = cfg.snnTraceLeak;
+    if (cfg.clipFrameIntervalMs!==undefined) CLIP_FRAME_INTERVAL_MS = cfg.clipFrameIntervalMs;
+    return true;
+  } catch(e){ return false; }
+}
+
+// ---- Minimal ZIP writer/reader (STORE method - no compression) ----
+function crc32(bytes){
+  if (!crc32.table){
+    const t = new Uint32Array(256);
+    for (let n=0;n<256;n++){ let c=n; for (let k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1); t[n]=c>>>0; }
+    crc32.table = t;
+  }
+  let crc = 0^(-1);
+  for (let i=0;i<bytes.length;i++) crc = (crc>>>8) ^ crc32.table[(crc^bytes[i])&0xFF];
+  return (crc^(-1))>>>0;
+}
+function makeZip(entries){
+  const enc = new TextEncoder();
+  const localParts=[], centralParts=[];
+  let offset=0;
+  for (const {name,data} of entries){
+    const nameBytes = enc.encode(name);
+    const crc = crc32(data); const size = data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true); lh.setUint16(4,20,true); lh.setUint16(6,0,true);
+    lh.setUint16(8,0,true); lh.setUint16(10,0,true); lh.setUint16(12,0,true);
+    lh.setUint32(14,crc,true); lh.setUint32(18,size,true); lh.setUint32(22,size,true);
+    lh.setUint16(26,nameBytes.length,true); lh.setUint16(28,0,true);
+    localParts.push(new Uint8Array(lh.buffer), nameBytes, data);
+    const localSize = 30+nameBytes.length+size;
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true); ch.setUint16(4,20,true); ch.setUint16(6,20,true);
+    ch.setUint16(8,0,true); ch.setUint16(10,0,true); ch.setUint16(12,0,true); ch.setUint16(14,0,true);
+    ch.setUint32(16,crc,true); ch.setUint32(20,size,true); ch.setUint32(24,size,true);
+    ch.setUint16(28,nameBytes.length,true); ch.setUint16(30,0,true); ch.setUint16(32,0,true);
+    ch.setUint16(34,0,true); ch.setUint16(36,0,true); ch.setUint32(38,0,true); ch.setUint32(42,offset,true);
+    centralParts.push(new Uint8Array(ch.buffer), nameBytes);
+    offset += localSize;
+  }
+  const centralStart = offset;
+  let centralSize=0; for (const p of centralParts) centralSize+=p.length;
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0,0x06054b50,true); eocd.setUint16(4,0,true); eocd.setUint16(6,0,true);
+  eocd.setUint16(8,entries.length,true); eocd.setUint16(10,entries.length,true);
+  eocd.setUint32(12,centralSize,true); eocd.setUint32(16,centralStart,true); eocd.setUint16(20,0,true);
+  const allParts = [...localParts, ...centralParts, new Uint8Array(eocd.buffer)];
+  let total=0; for (const p of allParts) total+=p.length;
+  const out = new Uint8Array(total);
+  let pos=0; for (const p of allParts){ out.set(p,pos); pos+=p.length; }
+  return out;
+}
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+async function exportAllZip(){
+  const enc = new TextEncoder();
+  const entries = [];
+  for (let c=0;c<CLASSES.length;c++){
+    const clips = await Store.listSamples(c);
+    for (const clip of clips){
+      if (clip.frames.length===1){
+        entries.push({ name:`images/${CLASSES[c].folder}/${clip.name}`, data: new Uint8Array(await clip.frames[0].arrayBuffer()) });
+      } else {
+        for (let i=0;i<clip.frames.length;i++){
+          entries.push({ name:`images/${CLASSES[c].folder}/${clip.name}/f${String(i).padStart(2,'0')}.jpg`, data: new Uint8Array(await clip.frames[i].arrayBuffer()) });
+        }
+      }
+    }
+  }
+  for (const fname of [ANN_WEIGHT_FILE, SNN_WEIGHT_FILE]){
+    const buf = await Store.readWeightFile(fname);
+    if (buf) entries.push({ name:`header/${fname}`, data: new Uint8Array(buf) });
+  }
+  await saveConfig();
+  const cfgText = await Store.readWeightFileText(CONFIG_FILE);
+  if (cfgText) entries.push({ name:`header/${CONFIG_FILE}`, data: enc.encode(cfgText) });
+  if (entries.length===0){ log('Nothing to export yet.'); return; }
+  downloadBlob(new Blob([makeZip(entries)],{type:'application/zip'}), 'vision-training-data.zip');
+  log(`Exported ${entries.length} file(s) to vision-training-data.zip.`);
+}
+async function importEntry(name, data){
+  if (name.startsWith('images/') && /\.jpe?g$/i.test(name)){
+    const rest = name.substring('images/'.length);
+    const slash = rest.indexOf('/');
+    const folder = rest.substring(0,slash);
+    const relPath = rest.substring(slash+1); // e.g. "clip_123/f00.jpg" or "img_456.jpg" (v002)
+    let classIdx = CLASSES.findIndex(c=>c.folder===folder);
+    if (classIdx<0){ CLASSES.push({label:folder, folder}); classIdx = CLASSES.length-1; }
+    await Store.writeImageAtPath(classIdx, relPath, new Blob([data], {type:'image/jpeg'}));
+  } else if (name === `header/${CONFIG_FILE}`){
+    await Store.writeWeightFile(CONFIG_FILE, new TextDecoder().decode(data));
+  } else if (name.startsWith('header/')){
+    const fname = name.substring('header/'.length);
+    await Store.writeWeightFile(fname, data.slice().buffer);
+  }
+}
+async function importZipFile(file){
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  let eocdOffset=-1;
+  for (let i=buf.length-22; i>=0 && i>buf.length-22-65557; i--) if (dv.getUint32(i,true)===0x06054b50){ eocdOffset=i; break; }
+  if (eocdOffset<0){ log('Not a valid zip file.'); return; }
+  const entryCount = dv.getUint16(eocdOffset+10,true);
+  let pos = dv.getUint32(eocdOffset+16,true);
+  let imported=0, skipped=0;
+  for (let e=0;e<entryCount;e++){
+    if (dv.getUint32(pos,true)!==0x02014b50) break;
+    const method = dv.getUint16(pos+10,true);
+    const compSize = dv.getUint32(pos+20,true);
+    const nameLen = dv.getUint16(pos+28,true);
+    const extraLen = dv.getUint16(pos+30,true);
+    const commentLen = dv.getUint16(pos+32,true);
+    const localOffset = dv.getUint32(pos+42,true);
+    const name = new TextDecoder().decode(buf.subarray(pos+46,pos+46+nameLen));
+    pos += 46+nameLen+extraLen+commentLen;
+    if (method!==0){ skipped++; continue; }
+    const lNameLen = dv.getUint16(localOffset+26,true);
+    const lExtraLen = dv.getUint16(localOffset+28,true);
+    const dataStart = localOffset+30+lNameLen+lExtraLen;
+    await importEntry(name, buf.subarray(dataStart, dataStart+compSize));
+    imported++;
+  }
+  await loadConfig();
+  rebuildArchitecture();
+  const annLoaded = await annLoadWeights();
+  const snnLoaded = await snnLoadWeights();
+  log(`Import complete: ${imported} file(s)${skipped?', '+skipped+' skipped (compressed entries not supported)':''}. ANN weights ${annLoaded?'loaded':'not present/mismatched'}, SNN weights ${snnLoaded?'loaded':'not present/mismatched'}.`);
+  buildClassList();
+}
+async function downloadWeightFile(name){
+  const buf = await Store.readWeightFile(name);
+  if (!buf){ log(`No ${name} saved yet.`); return; }
+  downloadBlob(new Blob([buf],{type:'application/octet-stream'}), name);
+}
+async function uploadWeightFile(name, file){
+  const buf = await file.arrayBuffer();
+  await Store.writeWeightFile(name, buf);
+  if (name===ANN_WEIGHT_FILE){ const ok=annDeserialize(buf); log(ok?'[ANN] Weights loaded from file.':'[ANN] File size does not match the CURRENT resolution/channels/class count - not loaded.'); }
+  if (name===SNN_WEIGHT_FILE){ const ok=snnDeserialize(buf); log(ok?'[SNN] Weights loaded from file.':'[SNN] File size does not match the CURRENT resolution/channels/class count - not loaded.'); }
+}
+async function importImageFilesForClass(classIdx, fileList){
+  let n=0;
+  for (const f of fileList){ await Store.captureClip(classIdx, [f]); n++; } // each still = its own 1-frame clip
+  log(`[Import] Added ${n} image(s) to '${CLASSES[classIdx].label}'.`);
+  buildClassList();
+  if (!document.getElementById('collectPanel').classList.contains('hidden')) openCollect(classIdx);
+}
+
+// ======================================================================
+// CAMERA LAYER - getUserMedia, works on iOS Safari / Android Chrome / desktop.
+// ======================================================================
+let videoEl, videoStream = null, cameraEnabled = false, currentFacingMode = 'environment';
+const scratchCanvases = {};
+function getScratchCanvas(w,h){
+  const key = w+'x'+h;
+  if (!scratchCanvases[key]){ const c=document.createElement('canvas'); c.width=w; c.height=h; scratchCanvases[key]=c; }
+  return scratchCanvases[key];
+}
+async function enableCamera(){
+  try {
+    if (videoStream) videoStream.getTracks().forEach(t=>t.stop());
+    videoStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:currentFacingMode, width:{ideal:640}, height:{ideal:640} }, audio:false });
+    videoEl.srcObject = videoStream;
+    await videoEl.play();
+    cameraEnabled = true;
+    document.getElementById('cameraStatus').innerHTML = 'Camera: <span class="ok">enabled</span>';
+    log('Camera enabled.');
+  } catch(e){ log('Camera error: '+e.message); }
+}
+async function switchCamera(){
+  currentFacingMode = currentFacingMode==='environment' ? 'user' : 'environment';
+  await enableCamera();
+}
+function videoSquareRect(){
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  const s = Math.min(vw,vh);
+  return { sx:(vw-s)/2, sy:(vh-s)/2, s };
+}
+async function captureSquareJpeg(){
+  const {sx,sy,s} = videoSquareRect();
+  const canvas = getScratchCanvas(CAPTURE_SIZE, CAPTURE_SIZE);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(videoEl, sx, sy, s, s, 0, 0, CAPTURE_SIZE, CAPTURE_SIZE);
+  return await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',0.85));
+}
+// Captures a short real video clip: `count` sequential JPEG frames,
+// `intervalMs` apart. This IS the "real time axis" v002 didn't have -
+// each frame is a genuinely different moment, not a re-sample of one photo.
+function setRecordingIndicator(on){
+  const el = document.getElementById('recIndicator');
+  if (el) el.classList.toggle('hidden', !on);
+}
+async function captureClipJpegs(count, intervalMs){
+  setRecordingIndicator(true);
+  try {
+    const frames = [];
+    for (let i=0;i<count;i++){
+      frames.push(await captureSquareJpeg());
+      if (i<count-1) await sleep(intervalMs);
+    }
+    return frames;
+  } finally {
+    setRecordingIndicator(false);
+  }
+}
+function fillInputBufferFromImageData(imgData, buf){
+  const n = INPUT_SIZE*INPUT_SIZE;
+  for (let p=0;p<n;p++){
+    const r=imgData[p*4]/255, g=imgData[p*4+1]/255, b=imgData[p*4+2]/255;
+    if (NUM_CHANNELS===1) buf[p] = 0.299*r+0.587*g+0.114*b;
+    else { buf[p*3]=r; buf[p*3+1]=g; buf[p*3+2]=b; }
+  }
+}
+function captureLiveInputBuffer(){
+  const {sx,sy,s} = videoSquareRect();
+  const canvas = getScratchCanvas(INPUT_SIZE, INPUT_SIZE);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(videoEl, sx, sy, s, s, 0, 0, INPUT_SIZE, INPUT_SIZE);
+  const imgData = ctx.getImageData(0,0,INPUT_SIZE,INPUT_SIZE).data;
+  const buf = new Float32Array(INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS);
+  fillInputBufferFromImageData(imgData, buf);
+  return buf;
+}
+async function decodeImageToBuffer(blob){
+  const bitmap = await createImageBitmap(blob);
+  const canvas = getScratchCanvas(INPUT_SIZE, INPUT_SIZE);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0, INPUT_SIZE, INPUT_SIZE);
+  const imgData = ctx.getImageData(0,0,INPUT_SIZE,INPUT_SIZE).data;
+  const buf = new Float32Array(INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS);
+  fillInputBufferFromImageData(imgData, buf);
+  bitmap.close();
+  return buf;
+}
+async function decodeClipToBuffers(frameBlobs){
+  return Promise.all(frameBlobs.map(decodeImageToBuffer));
+}
+// snnForward always expects exactly SNN_TIMESTEPS real frames. A clip
+// collected under a different SNN_TIMESTEPS setting (or a v002/imported
+// single still, which decodes to a 1-frame array) is stretched/trimmed to
+// fit: shorter clips repeat their last frame, longer clips are trimmed to
+// the first SNN_TIMESTEPS frames.
+function resampleClipToTimesteps(clipBufs){
+  if (clipBufs.length===SNN_TIMESTEPS) return clipBufs;
+  const out = new Array(SNN_TIMESTEPS);
+  for (let t=0;t<SNN_TIMESTEPS;t++) out[t] = clipBufs[Math.min(t, clipBufs.length-1)];
+  return out;
+}
+
+// ======================================================================
+// SHARED MATH HELPERS
+// ======================================================================
+function leakyRelu(x){ return x>0?x:0.1*x; }
+function leakyReluDeriv(x){ return x>0?1:0.1; }
+function clipValue(v, mn=-100, mx=100){ if (!isFinite(v)) return 0; return Math.max(mn, Math.min(mx, v)); }
+function softmaxInPlace(arr){
+  let mx=arr[0]; for (let i=1;i<arr.length;i++) if (arr[i]>mx) mx=arr[i];
+  let sum=0; for (let i=0;i<arr.length;i++){ arr[i]=Math.exp(arr[i]-mx); sum+=arr[i]; }
+  for (let i=0;i<arr.length;i++) arr[i]/=sum;
+}
+function shuffleArray(arr){ for (let i=arr.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; } }
+function adamUpdate(w,grad,m,v,lr,step){
+  const b1=0.9,b2=0.999,eps=1e-8;
+  const bc1=1-Math.pow(b1,step), bc2=1-Math.pow(b2,step);
+  for (let i=0;i<w.length;i++){
+    m[i]=b1*m[i]+(1-b1)*grad[i]; v[i]=b2*v[i]+(1-b2)*grad[i]*grad[i];
+    w[i]-=lr*(m[i]/bc1)/(Math.sqrt(v[i]/bc2)+eps);
+  }
+}
+function surrogateDeriv(memPre){ const d=1+10.0*Math.abs(memPre-LIF_THRESHOLD); return 1/(d*d); }
+
+// ======================================================================
+// ARCHITECTURE - recomputed whenever resolution/channels/class count change.
+// ======================================================================
+let ARCH = null;
+function computeArch(){
+  const NUM_CLASSES = Math.max(CLASSES.length, 1);
+  const CONV1_W_PER_FILTER = CONV1_KERNEL*CONV1_KERNEL*NUM_CHANNELS;
+  const CONV1_WEIGHTS = CONV1_W_PER_FILTER*CONV1_FILTERS;
+  const CONV2_W_PER_FILTER = CONV2_KERNEL*CONV2_KERNEL*CONV1_FILTERS;
+  const CONV2_WEIGHTS = CONV2_W_PER_FILTER*CONV2_FILTERS;
+  const CONV1_OUT = INPUT_SIZE-(CONV1_KERNEL-1);
+  const POOL1_OUT = Math.floor(CONV1_OUT/2);
+  const CONV2_OUT = POOL1_OUT-(CONV2_KERNEL-1);
+  const FLAT = CONV2_OUT*CONV2_OUT*CONV2_FILTERS;
+  const OUTPUT_WEIGHTS = FLAT*NUM_CLASSES;
+  return { NUM_CLASSES, CONV1_W_PER_FILTER, CONV1_WEIGHTS, CONV2_W_PER_FILTER, CONV2_WEIGHTS, CONV1_OUT, POOL1_OUT, CONV2_OUT, FLAT, OUTPUT_WEIGHTS };
+}
+function makeModelBuffers(a){
+  return {
+    conv1_w:new Float32Array(a.CONV1_WEIGHTS), conv1_b:new Float32Array(CONV1_FILTERS),
+    conv2_w:new Float32Array(a.CONV2_WEIGHTS), conv2_b:new Float32Array(CONV2_FILTERS),
+    output_w:new Float32Array(a.OUTPUT_WEIGHTS), output_b:new Float32Array(a.NUM_CLASSES),
+  };
+}
+function heInitModel(m,a){
+  const c1=Math.sqrt(2/a.CONV1_W_PER_FILTER); for (let i=0;i<a.CONV1_WEIGHTS;i++) m.conv1_w[i]=(Math.random()-0.5)*2*c1;
+  const c2=Math.sqrt(2/a.CONV2_W_PER_FILTER); for (let i=0;i<a.CONV2_WEIGHTS;i++) m.conv2_w[i]=(Math.random()-0.5)*2*c2;
+  const d=Math.sqrt(2/Math.max(a.FLAT,1)); for (let i=0;i<a.OUTPUT_WEIGHTS;i++) m.output_w[i]=(Math.random()-0.5)*2*d;
+}
+
+let Ann, AnnGrad, AnnM, AnnV;
+let Snn, SnnGrad, SnnM, SnnV;
+let conv1Output, pool1Output, conv2Output, denseOutput, denseOutputSnn;
+let snnC1Mem, snnC2Mem, snnTrace, snnInputSpike, snnC1Spike, snnPooled, snnC2Spike;
+let rInputSpike, rC1MemPre, rC1Spike, rPooled, rC2MemPre, rC2Spike, rTrace;
+
+function allocForwardBuffers(){
+  const a = ARCH;
+  conv1Output = new Float32Array(CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  pool1Output = new Float32Array(CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT);
+  conv2Output = new Float32Array(a.FLAT);
+  denseOutput = new Float32Array(a.NUM_CLASSES);
+  denseOutputSnn = new Float32Array(a.NUM_CLASSES);
+}
+function allocSnnRecording(){
+  const a = ARCH;
+  const N = INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS;
+  snnC1Mem = new Float32Array(CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  snnC2Mem = new Float32Array(a.FLAT);
+  snnTrace = new Float32Array(a.NUM_CLASSES);
+  snnInputSpike = new Uint8Array(N);
+  snnC1Spike = new Uint8Array(CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  snnPooled = new Uint8Array(CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT);
+  snnC2Spike = new Uint8Array(a.FLAT);
+  rInputSpike = new Uint8Array(SNN_TIMESTEPS*N);
+  rC1MemPre = new Float32Array(SNN_TIMESTEPS*CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  rC1Spike = new Uint8Array(SNN_TIMESTEPS*CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  rPooled = new Uint8Array(SNN_TIMESTEPS*CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT);
+  rC2MemPre = new Float32Array(SNN_TIMESTEPS*a.FLAT);
+  rC2Spike = new Uint8Array(SNN_TIMESTEPS*a.FLAT);
+  rTrace = new Float32Array(SNN_TIMESTEPS*a.NUM_CLASSES);
+}
+function rebuildArchitecture(){
+  ARCH = computeArch();
+  Ann = Object.assign(makeModelBuffers(ARCH), { trained:false, adamStep:0, freezeConv1:false, freezeConv2:false, freezeOutput:false });
+  AnnGrad = makeModelBuffers(ARCH); AnnM = makeModelBuffers(ARCH); AnnV = makeModelBuffers(ARCH);
+  heInitModel(Ann, ARCH);
+  Snn = Object.assign(makeModelBuffers(ARCH), { trained:false, adamStep:0, freezeConv1:false, freezeConv2:false, freezeOutput:false });
+  SnnGrad = makeModelBuffers(ARCH); SnnM = makeModelBuffers(ARCH); SnnV = makeModelBuffers(ARCH);
+  heInitModel(Snn, ARCH);
+  allocForwardBuffers();
+  allocSnnRecording();
+  updateDeviceSettingsPanel();
+  log(`Architecture rebuilt: ${INPUT_SIZE}x${INPUT_SIZE}x${NUM_CHANNELS}, ${ARCH.NUM_CLASSES} class(es). Both models reset to fresh weights.`);
+}
+
+// ======================================================================
+// ANN MODEL - ported from firmware-v004.ino's myAnnForward, plus a
+// standard backprop derivation (the device no longer trains, so there is
+// no C backward pass to port from - only the forward pass, which both
+// sides must match exactly, is shared).
+// ======================================================================
+function annForward(input){
+  const a = ARCH;
+  for (let f=0; f<CONV1_FILTERS; f++){
+    const ob=f*a.CONV1_OUT*a.CONV1_OUT;
+    for (let y=0;y<a.CONV1_OUT;y++) for (let x=0;x<a.CONV1_OUT;x++){
+      let sum = Ann.conv1_b[f];
+      for (let ky=0;ky<CONV1_KERNEL;ky++) for (let kx=0;kx<CONV1_KERNEL;kx++){
+        const inPos=((y+ky)*INPUT_SIZE+(x+kx))*NUM_CHANNELS;
+        const wPos=f*a.CONV1_W_PER_FILTER+ky*CONV1_KERNEL*NUM_CHANNELS+kx*NUM_CHANNELS;
+        for (let c=0;c<NUM_CHANNELS;c++) sum += input[inPos+c]*Ann.conv1_w[wPos+c];
+      }
+      conv1Output[ob+y*a.CONV1_OUT+x] = leakyRelu(clipValue(sum));
+    }
+  }
+  for (let f=0; f<CONV1_FILTERS; f++){
+    const ib=f*a.CONV1_OUT*a.CONV1_OUT, ob=f*a.POOL1_OUT*a.POOL1_OUT;
+    for (let y=0;y<a.POOL1_OUT;y++) for (let x=0;x<a.POOL1_OUT;x++){
+      const iy=y*2, ix=x*2;
+      let mv=conv1Output[ib+iy*a.CONV1_OUT+ix];
+      mv=Math.max(mv, conv1Output[ib+iy*a.CONV1_OUT+ix+1]);
+      mv=Math.max(mv, conv1Output[ib+(iy+1)*a.CONV1_OUT+ix]);
+      mv=Math.max(mv, conv1Output[ib+(iy+1)*a.CONV1_OUT+ix+1]);
+      pool1Output[ob+y*a.POOL1_OUT+x]=mv;
+    }
+  }
+  for (let f=0; f<CONV2_FILTERS; f++){
+    const ob=f*a.CONV2_OUT*a.CONV2_OUT;
+    for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++){
+      let sum = Ann.conv2_b[f];
+      for (let c=0;c<CONV1_FILTERS;c++){
+        const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+        for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+          sum += pool1Output[ib+(y+ky)*a.POOL1_OUT+(x+kx)] * Ann.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx];
+      }
+      conv2Output[ob+y*a.CONV2_OUT+x] = leakyRelu(clipValue(sum));
+    }
+  }
+  for (let c=0;c<a.NUM_CLASSES;c++){
+    let sum = Ann.output_b[c];
+    for (let i=0;i<a.FLAT;i++) sum += conv2Output[i]*Ann.output_w[c*a.FLAT+i];
+    denseOutput[c] = clipValue(sum, -50, 50);
+  }
+  softmaxInPlace(denseOutput);
+}
+function annZeroGrad(){ for (const k of ['conv1_w','conv1_b','conv2_w','conv2_b','output_w','output_b']) AnnGrad[k].fill(0); }
+function annBackward(input, label){
+  const a = ARCH;
+  const dDense = new Float32Array(a.NUM_CLASSES);
+  for (let c=0;c<a.NUM_CLASSES;c++) dDense[c] = denseOutput[c]-(c===label?1:0);
+  if (!Ann.freezeOutput){
+    for (let c=0;c<a.NUM_CLASSES;c++){
+      AnnGrad.output_b[c]+=dDense[c];
+      for (let i=0;i<a.FLAT;i++) AnnGrad.output_w[c*a.FLAT+i]+=conv2Output[i]*dDense[c];
+    }
+  }
+  const dFlat = new Float32Array(a.FLAT);
+  for (let i=0;i<a.FLAT;i++){ let s=0; for (let c=0;c<a.NUM_CLASSES;c++) s+=Ann.output_w[c*a.FLAT+i]*dDense[c]; dFlat[i]=s; }
+  const dConv2Pre = new Float32Array(a.FLAT);
+  for (let i=0;i<a.FLAT;i++) dConv2Pre[i] = dFlat[i]*leakyReluDeriv(conv2Output[i]);
+  const dPool1 = new Float32Array(CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT);
+  for (let f=0;f<CONV2_FILTERS;f++){
+    const ob=f*a.CONV2_OUT*a.CONV2_OUT;
+    for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++){
+      const g = dConv2Pre[ob+y*a.CONV2_OUT+x];
+      if (!Ann.freezeConv2){
+        AnnGrad.conv2_b[f]+=g;
+        for (let c=0;c<CONV1_FILTERS;c++){
+          const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+          for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+            AnnGrad.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx] += pool1Output[ib+(y+ky)*a.POOL1_OUT+(x+kx)]*g;
+        }
+      }
+      for (let c=0;c<CONV1_FILTERS;c++){
+        const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+        for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+          dPool1[ib+(y+ky)*a.POOL1_OUT+(x+kx)] += Ann.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx]*g;
+      }
+    }
+  }
+  const dConv1Post = new Float32Array(CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT);
+  for (let f=0;f<CONV1_FILTERS;f++){
+    const ib=f*a.CONV1_OUT*a.CONV1_OUT, pb=f*a.POOL1_OUT*a.POOL1_OUT;
+    for (let y=0;y<a.POOL1_OUT;y++) for (let x=0;x<a.POOL1_OUT;x++){
+      const iy=y*2, ix=x*2;
+      const i00=ib+iy*a.CONV1_OUT+ix, i01=i00+1, i10=ib+(iy+1)*a.CONV1_OUT+ix, i11=i10+1;
+      let winner=i00, wv=conv1Output[i00];
+      if (conv1Output[i01]>wv){winner=i01;wv=conv1Output[i01];}
+      if (conv1Output[i10]>wv){winner=i10;wv=conv1Output[i10];}
+      if (conv1Output[i11]>wv){winner=i11;wv=conv1Output[i11];}
+      dConv1Post[winner]+=dPool1[pb+y*a.POOL1_OUT+x];
+    }
+  }
+  if (!Ann.freezeConv1){
+    for (let f=0;f<CONV1_FILTERS;f++){
+      const ob=f*a.CONV1_OUT*a.CONV1_OUT;
+      for (let y=0;y<a.CONV1_OUT;y++) for (let x=0;x<a.CONV1_OUT;x++){
+        const g = dConv1Post[ob+y*a.CONV1_OUT+x]*leakyReluDeriv(conv1Output[ob+y*a.CONV1_OUT+x]);
+        AnnGrad.conv1_b[f]+=g;
+        for (let ky=0;ky<CONV1_KERNEL;ky++) for (let kx=0;kx<CONV1_KERNEL;kx++){
+          const inPos=((y+ky)*INPUT_SIZE+(x+kx))*NUM_CHANNELS;
+          const wPos=f*a.CONV1_W_PER_FILTER+ky*CONV1_KERNEL*NUM_CHANNELS+kx*NUM_CHANNELS;
+          for (let c=0;c<NUM_CHANNELS;c++) AnnGrad.conv1_w[wPos+c]+=input[inPos+c]*g;
+        }
+      }
+    }
+  }
+}
+function annApplyAdamBatch(){
+  Ann.adamStep++;
+  if (!Ann.freezeConv1){ adamUpdate(Ann.conv1_w,AnnGrad.conv1_w,AnnM.conv1_w,AnnV.conv1_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.conv1_b,AnnGrad.conv1_b,AnnM.conv1_b,AnnV.conv1_b,LEARNING_RATE,Ann.adamStep); }
+  if (!Ann.freezeConv2){ adamUpdate(Ann.conv2_w,AnnGrad.conv2_w,AnnM.conv2_w,AnnV.conv2_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.conv2_b,AnnGrad.conv2_b,AnnM.conv2_b,AnnV.conv2_b,LEARNING_RATE,Ann.adamStep); }
+  if (!Ann.freezeOutput){ adamUpdate(Ann.output_w,AnnGrad.output_w,AnnM.output_w,AnnV.output_w,LEARNING_RATE,Ann.adamStep); adamUpdate(Ann.output_b,AnnGrad.output_b,AnnM.output_b,AnnV.output_b,LEARNING_RATE,Ann.adamStep); }
+}
+function modelSerialize(m,a){
+  const totalFloats = a.CONV1_WEIGHTS+CONV1_FILTERS+a.CONV2_WEIGHTS+CONV2_FILTERS+a.OUTPUT_WEIGHTS+a.NUM_CLASSES;
+  const buf = new ArrayBuffer(totalFloats*4); const dv = new DataView(buf); let o=0;
+  const w=(arr)=>{ for (let i=0;i<arr.length;i++){ dv.setFloat32(o,arr[i],true); o+=4; } };
+  w(m.conv1_w); w(m.conv1_b); w(m.conv2_w); w(m.conv2_b); w(m.output_w); w(m.output_b);
+  return buf;
+}
+function modelDeserialize(m,a,buf){
+  const totalFloats = a.CONV1_WEIGHTS+CONV1_FILTERS+a.CONV2_WEIGHTS+CONV2_FILTERS+a.OUTPUT_WEIGHTS+a.NUM_CLASSES;
+  if (buf.byteLength !== totalFloats*4) return false;
+  const dv = new DataView(buf); let o=0;
+  const r=(arr)=>{ for (let i=0;i<arr.length;i++){ arr[i]=dv.getFloat32(o,true); o+=4; } };
+  r(m.conv1_w); r(m.conv1_b); r(m.conv2_w); r(m.conv2_b); r(m.output_w); r(m.output_b);
+  return true;
+}
+function annSerialize(){ return modelSerialize(Ann, ARCH); }
+function annDeserialize(buf){ const ok = modelDeserialize(Ann, ARCH, buf); if (ok) Ann.trained=true; return ok; }
+async function annSaveWeights(){ await Store.writeWeightFile(ANN_WEIGHT_FILE, annSerialize()); }
+async function annLoadWeights(){ const buf = await Store.readWeightFile(ANN_WEIGHT_FILE); return buf ? annDeserialize(buf) : false; }
+
+// ======================================================================
+// SNN MODEL - real-video rate-coded LIF vision classifier.
+// Same forward math as v002 (and the firmware's mySnnForwardInfer), with
+// one change: each timestep now rate-codes a DIFFERENT real frame of a
+// clip (frames[t]) instead of re-rolling the same still image every step.
+// Per-timestep recording is kept so backward (surrogate-gradient BPTT) is
+// possible; that function only reads its own recorded spike trains, so it
+// needed no changes at all. Recording is always on (even during live
+// inference) since it's also what feeds the heatmap - trivial extra memory.
+// `frames` must have exactly SNN_TIMESTEPS entries (see
+// resampleClipToTimesteps / the live rolling window in actionInferSnn).
+// ======================================================================
+function snnForward(frames, record){
+  const a = ARCH;
+  snnC1Mem.fill(0); snnC2Mem.fill(0); snnTrace.fill(0);
+  const N = INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS;
+  const c1Size = CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT;
+  const poolSize = CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT;
+  for (let t=0;t<SNN_TIMESTEPS;t++){
+    const frame = frames[t];
+    for (let i=0;i<N;i++) snnInputSpike[i] = (Math.random()<frame[i]) ? 1:0;
+    if (record) rInputSpike.set(snnInputSpike, t*N);
+
+    for (let f=0;f<CONV1_FILTERS;f++){
+      const ob=f*a.CONV1_OUT*a.CONV1_OUT;
+      for (let y=0;y<a.CONV1_OUT;y++) for (let x=0;x<a.CONV1_OUT;x++){
+        let current = Snn.conv1_b[f];
+        for (let ky=0;ky<CONV1_KERNEL;ky++) for (let kx=0;kx<CONV1_KERNEL;kx++){
+          const inPos=((y+ky)*INPUT_SIZE+(x+kx))*NUM_CHANNELS;
+          const wPos=f*a.CONV1_W_PER_FILTER+ky*CONV1_KERNEL*NUM_CHANNELS+kx*NUM_CHANNELS;
+          for (let c=0;c<NUM_CHANNELS;c++) current += snnInputSpike[inPos+c]*Snn.conv1_w[wPos+c];
+        }
+        const idx=ob+y*a.CONV1_OUT+x;
+        const memPre = snnC1Mem[idx]*LIF_LEAK+current;
+        const spike = memPre>=LIF_THRESHOLD?1:0;
+        if (record){ rC1MemPre[t*c1Size+idx]=memPre; rC1Spike[t*c1Size+idx]=spike; }
+        snnC1Mem[idx]=memPre-(spike?LIF_THRESHOLD:0);
+        snnC1Spike[idx]=spike;
+      }
+    }
+    for (let f=0;f<CONV1_FILTERS;f++){
+      const ib=f*a.CONV1_OUT*a.CONV1_OUT, ob=f*a.POOL1_OUT*a.POOL1_OUT;
+      for (let y=0;y<a.POOL1_OUT;y++) for (let x=0;x<a.POOL1_OUT;x++){
+        const iy=y*2, ix=x*2;
+        const sOr = snnC1Spike[ib+iy*a.CONV1_OUT+ix]|snnC1Spike[ib+iy*a.CONV1_OUT+ix+1]|snnC1Spike[ib+(iy+1)*a.CONV1_OUT+ix]|snnC1Spike[ib+(iy+1)*a.CONV1_OUT+ix+1];
+        snnPooled[ob+y*a.POOL1_OUT+x]=sOr;
+      }
+    }
+    if (record) rPooled.set(snnPooled, t*poolSize);
+
+    for (let f=0;f<CONV2_FILTERS;f++){
+      const ob=f*a.CONV2_OUT*a.CONV2_OUT;
+      for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++){
+        let current = Snn.conv2_b[f];
+        for (let c=0;c<CONV1_FILTERS;c++){
+          const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+          for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+            current += snnPooled[ib+(y+ky)*a.POOL1_OUT+(x+kx)]*Snn.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx];
+        }
+        const idx = ob+y*a.CONV2_OUT+x;
+        const memPre = snnC2Mem[idx]*LIF_LEAK+current;
+        const spike = memPre>=LIF_THRESHOLD?1:0;
+        if (record){ rC2MemPre[t*a.FLAT+idx]=memPre; rC2Spike[t*a.FLAT+idx]=spike; }
+        snnC2Mem[idx]=memPre-(spike?LIF_THRESHOLD:0);
+        snnC2Spike[idx]=spike;
+      }
+    }
+    for (let c=0;c<a.NUM_CLASSES;c++){
+      let current = Snn.output_b[c];
+      for (let i=0;i<a.FLAT;i++) current += snnC2Spike[i]*Snn.output_w[c*a.FLAT+i];
+      snnTrace[c] = snnTrace[c]*SNN_TRACE_LEAK+current;
+    }
+    if (record) rTrace.set(snnTrace, t*a.NUM_CLASSES);
+  }
+  denseOutputSnn.set(snnTrace);
+  softmaxInPlace(denseOutputSnn);
+}
+function snnZeroGrad(){ for (const k of ['conv1_w','conv1_b','conv2_w','conv2_b','output_w','output_b']) SnnGrad[k].fill(0); }
+function snnBackwardBPTT(label){
+  const a = ARCH;
+  const c1Size = CONV1_FILTERS*a.CONV1_OUT*a.CONV1_OUT;
+  const N = INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS;
+  const lossFromT = Math.floor(SNN_TIMESTEPS/2);
+  const numLossSteps = Math.max(SNN_TIMESTEPS-lossFromT,1);
+  const lossW = 1/numLossSteps;
+  let lossTotal = 0;
+  const dTrace = new Float32Array(a.NUM_CLASSES);
+  let dC2MemPost = new Float32Array(a.FLAT);
+  let dC1MemPost = new Float32Array(c1Size);
+  const p = new Float32Array(a.NUM_CLASSES);
+
+  for (let t=SNN_TIMESTEPS-1;t>=0;t--){
+    if (t>=lossFromT){
+      for (let c=0;c<a.NUM_CLASSES;c++) p[c]=rTrace[t*a.NUM_CLASSES+c];
+      softmaxInPlace(p);
+      lossTotal += -Math.log(Math.max(p[label],1e-7))*lossW;
+      for (let c=0;c<a.NUM_CLASSES;c++) dTrace[c] += (p[c]-(c===label?1:0))*lossW;
+    }
+    const dOutCurrent = new Float32Array(a.NUM_CLASSES);
+    for (let c=0;c<a.NUM_CLASSES;c++) dOutCurrent[c]=dTrace[c];
+    for (let c=0;c<a.NUM_CLASSES;c++) dTrace[c]*=SNN_TRACE_LEAK;
+
+    const c2Off = t*a.FLAT;
+    const dC2Spike = new Float32Array(a.FLAT);
+    for (let c=0;c<a.NUM_CLASSES;c++){
+      if (!Snn.freezeOutput){
+        SnnGrad.output_b[c]+=dOutCurrent[c];
+        for (let i=0;i<a.FLAT;i++) SnnGrad.output_w[c*a.FLAT+i]+=rC2Spike[c2Off+i]*dOutCurrent[c];
+      }
+      for (let i=0;i<a.FLAT;i++) dC2Spike[i]+=Snn.output_w[c*a.FLAT+i]*dOutCurrent[c];
+    }
+    const dC2MemPre = new Float32Array(a.FLAT);
+    for (let i=0;i<a.FLAT;i++){ const sg=surrogateDeriv(rC2MemPre[c2Off+i]); dC2MemPre[i]=dC2Spike[i]*sg+dC2MemPost[i]; }
+
+    const dPooled = new Float32Array(CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT);
+    for (let f=0;f<CONV2_FILTERS;f++){
+      const ob=f*a.CONV2_OUT*a.CONV2_OUT;
+      for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++){
+        const g = dC2MemPre[ob+y*a.CONV2_OUT+x];
+        if (!Snn.freezeConv2){
+          SnnGrad.conv2_b[f]+=g;
+          for (let c=0;c<CONV1_FILTERS;c++){
+            const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+            for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+              SnnGrad.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx] += rPooled[t*CONV1_FILTERS*a.POOL1_OUT*a.POOL1_OUT+ib+(y+ky)*a.POOL1_OUT+(x+kx)]*g;
+          }
+        }
+        for (let c=0;c<CONV1_FILTERS;c++){
+          const ib=c*a.POOL1_OUT*a.POOL1_OUT;
+          for (let ky=0;ky<CONV2_KERNEL;ky++) for (let kx=0;kx<CONV2_KERNEL;kx++)
+            dPooled[ib+(y+ky)*a.POOL1_OUT+(x+kx)] += Snn.conv2_w[f*a.CONV2_W_PER_FILTER+c*(CONV2_KERNEL*CONV2_KERNEL)+ky*CONV2_KERNEL+kx]*g;
+        }
+      }
+    }
+    // OR-pool backward: not differentiable, spread gradient to all 4 (same convention as the motion SNN)
+    const dC1Spike = new Float32Array(c1Size);
+    for (let f=0;f<CONV1_FILTERS;f++){
+      const ib=f*a.CONV1_OUT*a.CONV1_OUT, pb=f*a.POOL1_OUT*a.POOL1_OUT;
+      for (let y=0;y<a.POOL1_OUT;y++) for (let x=0;x<a.POOL1_OUT;x++){
+        const iy=y*2, ix=x*2, g=dPooled[pb+y*a.POOL1_OUT+x];
+        dC1Spike[ib+iy*a.CONV1_OUT+ix]+=g; dC1Spike[ib+iy*a.CONV1_OUT+ix+1]+=g;
+        dC1Spike[ib+(iy+1)*a.CONV1_OUT+ix]+=g; dC1Spike[ib+(iy+1)*a.CONV1_OUT+ix+1]+=g;
+      }
+    }
+    const dC1MemPre = new Float32Array(c1Size);
+    for (let i=0;i<c1Size;i++){ const sg=surrogateDeriv(rC1MemPre[t*c1Size+i]); dC1MemPre[i]=dC1Spike[i]*sg+dC1MemPost[i]; }
+    if (!Snn.freezeConv1){
+      for (let f=0;f<CONV1_FILTERS;f++){
+        const ob=f*a.CONV1_OUT*a.CONV1_OUT;
+        for (let y=0;y<a.CONV1_OUT;y++) for (let x=0;x<a.CONV1_OUT;x++){
+          const g = dC1MemPre[ob+y*a.CONV1_OUT+x];
+          SnnGrad.conv1_b[f]+=g;
+          for (let ky=0;ky<CONV1_KERNEL;ky++) for (let kx=0;kx<CONV1_KERNEL;kx++){
+            const inPos=((y+ky)*INPUT_SIZE+(x+kx))*NUM_CHANNELS;
+            const wPos=f*a.CONV1_W_PER_FILTER+ky*CONV1_KERNEL*NUM_CHANNELS+kx*NUM_CHANNELS;
+            const inOff = t*N;
+            for (let c=0;c<NUM_CHANNELS;c++) SnnGrad.conv1_w[wPos+c]+=rInputSpike[inOff+inPos+c]*g;
+          }
+        }
+      }
+    }
+    for (let i=0;i<a.FLAT;i++) dC2MemPost[i]=dC2MemPre[i]*LIF_LEAK;
+    for (let i=0;i<c1Size;i++) dC1MemPost[i]=dC1MemPre[i]*LIF_LEAK;
+  }
+  return lossTotal;
+}
+function snnApplyAdam(){
+  Snn.adamStep++;
+  if (!Snn.freezeConv1){ adamUpdate(Snn.conv1_w,SnnGrad.conv1_w,SnnM.conv1_w,SnnV.conv1_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.conv1_b,SnnGrad.conv1_b,SnnM.conv1_b,SnnV.conv1_b,LEARNING_RATE,Snn.adamStep); }
+  if (!Snn.freezeConv2){ adamUpdate(Snn.conv2_w,SnnGrad.conv2_w,SnnM.conv2_w,SnnV.conv2_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.conv2_b,SnnGrad.conv2_b,SnnM.conv2_b,SnnV.conv2_b,LEARNING_RATE,Snn.adamStep); }
+  if (!Snn.freezeOutput){ adamUpdate(Snn.output_w,SnnGrad.output_w,SnnM.output_w,SnnV.output_w,LEARNING_RATE,Snn.adamStep); adamUpdate(Snn.output_b,SnnGrad.output_b,SnnM.output_b,SnnV.output_b,LEARNING_RATE,Snn.adamStep); }
+}
+function snnSerialize(){ return modelSerialize(Snn, ARCH); }
+function snnDeserialize(buf){ const ok = modelDeserialize(Snn, ARCH, buf); if (ok) Snn.trained=true; return ok; }
+async function snnSaveWeights(){ await Store.writeWeightFile(SNN_WEIGHT_FILE, snnSerialize()); }
+async function snnLoadWeights(){ const buf = await Store.readWeightFile(SNN_WEIGHT_FILE); return buf ? snnDeserialize(buf) : false; }
+
+// ======================================================================
+// HEATMAP - "where is the model looking": ANN uses max Conv2 activation per
+// cell, SNN uses total Conv2 spike count per cell across all timesteps.
+// ======================================================================
+function computeAnnHeatmap(){
+  const a = ARCH;
+  const grid = new Float32Array(a.CONV2_OUT*a.CONV2_OUT);
+  for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++){
+    let mx=-Infinity;
+    for (let f=0;f<CONV2_FILTERS;f++) mx=Math.max(mx, conv2Output[f*a.CONV2_OUT*a.CONV2_OUT+y*a.CONV2_OUT+x]);
+    grid[y*a.CONV2_OUT+x]=mx;
+  }
+  return { grid, w:a.CONV2_OUT, h:a.CONV2_OUT };
+}
+function computeSnnHeatmap(){
+  const a = ARCH;
+  const grid = new Float32Array(a.CONV2_OUT*a.CONV2_OUT);
+  for (let t=0;t<SNN_TIMESTEPS;t++){
+    for (let f=0;f<CONV2_FILTERS;f++){
+      const ob=f*a.CONV2_OUT*a.CONV2_OUT;
+      for (let y=0;y<a.CONV2_OUT;y++) for (let x=0;x<a.CONV2_OUT;x++)
+        grid[y*a.CONV2_OUT+x] += rC2Spike[t*a.FLAT+ob+y*a.CONV2_OUT+x];
+    }
+  }
+  return { grid, w:a.CONV2_OUT, h:a.CONV2_OUT };
+}
+function renderHeatmap(hm){
+  const canvasEl = document.getElementById('heatmapCanvas');
+  if (!showHeatmap){ canvasEl.getContext('2d').clearRect(0,0,canvasEl.width,canvasEl.height); return; }
+  let mn=Infinity, mx=-Infinity;
+  for (const v of hm.grid){ if (v<mn) mn=v; if (v>mx) mx=v; }
+  const range = (mx-mn)||1;
+  const ctx = canvasEl.getContext('2d');
+  const cw = canvasEl.width, ch = canvasEl.height;
+  const cellW = cw/hm.w, cellH = ch/hm.h;
+  for (let y=0;y<hm.h;y++) for (let x=0;x<hm.w;x++){
+    const v = (hm.grid[y*hm.w+x]-mn)/range;
+    const r = Math.round(255*v), b = Math.round(255*(1-v)), g = Math.round(80*(1-Math.abs(v-0.5)*2));
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(x*cellW, y*cellH, cellW+1, cellH+1);
+  }
+}
+
+// ======================================================================
+// ACTIONS: DATA COLLECTION
+// ======================================================================
+let collectClassIdx = -1;
+function openCollect(classIdx){
+  collectClassIdx = classIdx;
+  document.getElementById('collectPanel').classList.remove('hidden');
+  document.getElementById('cameraCard').scrollIntoView({ behavior:'smooth', block:'start' });
+  document.getElementById('galleryGrid').classList.add('hidden');
+  galleryRevokeUrls();
+  refreshCollectCount();
+}
+async function refreshCollectCount(){
+  const n = await Store.countSamples(collectClassIdx);
+  document.getElementById('collectTitleText').textContent = `Collect: ${CLASSES[collectClassIdx].label}`;
+  document.getElementById('collectCount').textContent = `${n} clip(s) saved so far.`;
+  document.getElementById('clipFrameCountLabel').textContent = SNN_TIMESTEPS;
+  const grid = document.getElementById('galleryGrid');
+  if (!grid.classList.contains('hidden')) await refreshGallery();
+}
+async function captureOneClip(classIdx){
+  if (!cameraEnabled){ log('Enable the camera first.'); return; }
+  log(`[Collect] Recording clip (${SNN_TIMESTEPS} frames, ${CLIP_FRAME_INTERVAL_MS}ms apart)...`);
+  const frames = await captureClipJpegs(SNN_TIMESTEPS, CLIP_FRAME_INTERVAL_MS);
+  await Store.captureClip(classIdx, frames);
+  const n = await Store.countSamples(classIdx);
+  log(`[Collect] Saved clip for '${CLASSES[classIdx].label}' (total ${n}).`);
+  await refreshCollectCount();
+  buildClassList();
+}
+async function autoCollect(classIdx, count){
+  stopRequested = false;
+  for (let i=0;i<count;i++){
+    if (stopRequested){ log(`[Collect] Auto-collect stopped early after ${i}/${count}.`); return; }
+    await captureOneClip(classIdx);
+    await sleep(600);
+  }
+  log(`[Collect] Auto-collect complete: ${count} new clips.`);
+}
+
+// ======================================================================
+// GALLERY - view captured clips for the class currently open in Collect,
+// with a delete button per clip. Thumbnail is the clip's middle frame.
+// ======================================================================
+let _galleryUrls = [];
+function galleryRevokeUrls(){
+  for (const u of _galleryUrls) URL.revokeObjectURL(u);
+  _galleryUrls = [];
+}
+async function refreshGallery(){
+  const grid = document.getElementById('galleryGrid');
+  galleryRevokeUrls();
+  grid.innerHTML = '';
+  const clips = await Store.listSamples(collectClassIdx);
+  if (!clips.length){ grid.innerHTML = '<p class="small">No clips yet.</p>'; return; }
+  for (const clip of clips){
+    const thumbBlob = clip.frames[Math.floor((clip.frames.length-1)/2)];
+    const url = URL.createObjectURL(thumbBlob);
+    _galleryUrls.push(url);
+    const item = document.createElement('div');
+    item.className = 'galleryItem';
+    const img = document.createElement('img'); img.src = url; img.alt = clip.name;
+    const cap = document.createElement('div'); cap.className = 'cap';
+    cap.textContent = clip.frames.length>1 ? `${clip.frames.length} frames` : 'still';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '\u00d7';
+    del.title = 'Delete this clip';
+    del.onclick = async (e)=>{
+      e.stopPropagation();
+      if (!confirm(`Delete this clip (${clip.frames.length} frame${clip.frames.length>1?'s':''}) for '${CLASSES[collectClassIdx].label}'? This can't be undone.`)) return;
+      await Store.deleteClip(collectClassIdx, clip.name);
+      log(`[Gallery] Deleted clip '${clip.name}' from '${CLASSES[collectClassIdx].label}'.`);
+      await refreshCollectCount(); // also re-runs refreshGallery since the grid is visible
+      buildClassList();
+    };
+    item.appendChild(img); item.appendChild(cap); item.appendChild(del);
+    grid.appendChild(item);
+  }
+}
+function toggleGallery(){
+  const grid = document.getElementById('galleryGrid');
+  const hidden = grid.classList.toggle('hidden');
+  if (!hidden) refreshGallery(); else galleryRevokeUrls();
+}
+
+// ======================================================================
+// TRAINING DATA SET
+// ======================================================================
+async function buildTrainingList(){
+  const trainingData = [];
+  const counts = new Array(CLASSES.length).fill(0);
+  for (let c=0;c<CLASSES.length;c++){
+    const clips = await Store.listSamples(c);
+    counts[c] = clips.length;
+    for (const clip of clips){
+      const rawBufs = await decodeClipToBuffers(clip.frames);
+      const clipBufs = resampleClipToTimesteps(rawBufs);
+      // ANN still trains on one still frame - the middle of the clip.
+      const keyBuf = rawBufs[Math.floor((rawBufs.length-1)/2)];
+      trainingData.push({ buf: keyBuf, clipBufs, label: c });
+    }
+  }
+  return { trainingData, counts };
+}
+function splitValidation(trainingData){
+  shuffleArray(trainingData);
+  const held = new Array(CLASSES.length).fill(0);
+  const valData=[], trainOnly=[];
+  if (VALIDATION_SAMPLES>0){
+    for (const it of trainingData){
+      if (held[it.label]<VALIDATION_SAMPLES){ valData.push(it); held[it.label]++; }
+      else trainOnly.push(it);
+    }
+    return { valData, trainData: trainOnly };
+  }
+  return { valData: [], trainData: trainingData };
+}
+
+// ======================================================================
+// TRAIN ANN
+// ======================================================================
+async function trainAnnOnce(trainData, valData, tag){
+  const nTrain = Math.max(trainData.length,1);
+  let bestAcc=-1, bestEpoch=-1;
+  for (let epoch=0; epoch<TARGET_EPOCHS; epoch++){
+    if (stopRequested) return { aborted:true };
+    shuffleArray(trainData);
+    let loss=0, correct=0, processed=0;
+    annZeroGrad();
+    for (let si=0; si<trainData.length; si++){
+      if (stopRequested) return { aborted:true };
+      annForward(trainData[si].buf);
+      const label = trainData[si].label;
+      loss += -Math.log(Math.max(denseOutput[label],1e-7));
+      let pred=0; for (let j=1;j<ARCH.NUM_CLASSES;j++) if (denseOutput[j]>denseOutput[pred]) pred=j;
+      if (pred===label) correct++;
+      annBackward(trainData[si].buf, label);
+      processed++;
+      if ((si+1)%BATCH_SIZE===0 || si===trainData.length-1){
+        const sc=1/processed;
+        for (const k of ['conv1_w','conv1_b','conv2_w','conv2_b','output_w','output_b']){ const arr=AnnGrad[k]; for (let i=0;i<arr.length;i++) arr[i]*=sc; }
+        annApplyAdamBatch();
+        annZeroGrad(); processed=0;
+      }
+      if (si%4===0) await sleep(0);
+    }
+    const trainAcc = 100*correct/nTrain;
+    let valAcc=0;
+    if (valData.length>0){
+      let vc=0;
+      for (const vi of valData){ annForward(vi.buf); let p=0; for (let j=1;j<ARCH.NUM_CLASSES;j++) if (denseOutput[j]>denseOutput[p]) p=j; if (p===vi.label) vc++; }
+      valAcc = 100*vc/valData.length;
+    }
+    const score = valData.length>0?valAcc:trainAcc;
+    const isBest = score>bestAcc;
+    if (isBest){ bestAcc=score; bestEpoch=epoch+1; }
+    log(`[${tag}] Epoch ${epoch+1}/${TARGET_EPOCHS} Loss=${(loss/nTrain).toFixed(4)} TrainAcc=${trainAcc.toFixed(1)}% ValAcc=${valAcc.toFixed(1)}%${isBest?'  <- best so far':''}`);
+    updateTrainProgress(epoch+1, TARGET_EPOCHS, trainAcc, valAcc);
+    await sleep(0);
+  }
+  Ann.trained = true;
+  await annSaveWeights();
+  log(`[${tag}] Done. Best ${valData.length>0?'ValAcc':'TrainAcc'}=${bestAcc.toFixed(1)}% at epoch ${bestEpoch}. Weights saved.`);
+  return { aborted:false, bestAcc, bestEpoch };
+}
+async function actionTrainAnn(continuous){
+  if (CLASSES.length<2){ log('Add at least 2 classes first.'); return; }
+  const tag = continuous ? 'ANN-auto' : 'ANN';
+  const { trainingData, counts } = await buildTrainingList();
+  log(`[${tag}] Images found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
+  if (trainingData.length===0){ log(`[${tag}] No training images - collect some first.`); return; }
+  const { valData, trainData } = splitValidation(trainingData);
+  log(`[${tag}] Training on ${trainData.length} images, holding out ${valData.length} for validation. ${TARGET_EPOCHS} epochs/loop, lr=${LEARNING_RATE}, batch=${BATCH_SIZE}.`);
+  stopRequested = false;
+  showProgress(true);
+  if (!continuous){
+    const res = await trainAnnOnce(trainData, valData, tag);
+    if (res.aborted) log(`[${tag}] Stopped - nothing saved for this run.`);
+    showProgress(false); return;
+  }
+  let loopNo=0, savedLoops=0;
+  while (!stopRequested){
+    loopNo++;
+    log(`[ANN-auto] ---- Loop ${loopNo} starting ----`);
+    const res = await trainAnnOnce(trainData, valData, tag);
+    if (res.aborted){ log(`[ANN-auto] Stopped. Loop ${loopNo} discarded. ${savedLoops} loop(s) saved.`); break; }
+    savedLoops++;
+    log(`[ANN-auto] Loop ${loopNo} complete (${savedLoops} saved so far).`);
+  }
+  showProgress(false);
+}
+
+// ======================================================================
+// TRAIN SNN
+// ======================================================================
+async function trainSnnOnce(trainData, valData, tag){
+  const nTrain = Math.max(trainData.length,1);
+  let bestAcc=-1, bestEpoch=-1;
+  for (let epoch=0; epoch<TARGET_EPOCHS; epoch++){
+    if (stopRequested) return { aborted:true };
+    shuffleArray(trainData);
+    let lossSum=0, correct=0, inBatch=0;
+    snnZeroGrad();
+    for (let si=0; si<trainData.length; si++){
+      if (stopRequested) return { aborted:true };
+      snnForward(trainData[si].clipBufs, true);
+      const label = trainData[si].label;
+      let pred=0; for (let j=1;j<ARCH.NUM_CLASSES;j++) if (denseOutputSnn[j]>denseOutputSnn[pred]) pred=j;
+      if (pred===label) correct++;
+      lossSum += snnBackwardBPTT(label);
+      inBatch++;
+      if (inBatch>=BATCH_SIZE || si===trainData.length-1){
+        for (const k of ['conv1_w','conv1_b','conv2_w','conv2_b','output_w','output_b']){ const arr=SnnGrad[k]; const sc=1/inBatch; for (let i=0;i<arr.length;i++) arr[i]*=sc; }
+        snnApplyAdam();
+        snnZeroGrad(); inBatch=0;
+      }
+      if (si%2===0) await sleep(0);
+    }
+    const trainAcc = 100*correct/nTrain;
+    let valAcc=0;
+    if (valData.length>0){
+      let vc=0;
+      for (const vi of valData){
+        snnForward(vi.clipBufs, true);
+        let p=0; for (let j=1;j<ARCH.NUM_CLASSES;j++) if (denseOutputSnn[j]>denseOutputSnn[p]) p=j;
+        if (p===vi.label) vc++;
+      }
+      valAcc = 100*vc/valData.length;
+    }
+    const score = valData.length>0?valAcc:trainAcc;
+    const isBest = score>bestAcc;
+    if (isBest){ bestAcc=score; bestEpoch=epoch+1; }
+    log(`[${tag}] Epoch ${epoch+1}/${TARGET_EPOCHS} Loss=${(lossSum/nTrain).toFixed(4)} TrainAcc=${trainAcc.toFixed(1)}% ValAcc=${valAcc.toFixed(1)}%${isBest?' <- best so far':''}`);
+    updateTrainProgress(epoch+1, TARGET_EPOCHS, trainAcc, valAcc);
+    await sleep(0);
+  }
+  Snn.trained = true;
+  await snnSaveWeights();
+  log(`[${tag}] Done. Best ${valData.length>0?'ValAcc':'TrainAcc'}=${bestAcc.toFixed(1)}% at epoch ${bestEpoch}. Weights saved.`);
+  return { aborted:false, bestAcc, bestEpoch };
+}
+async function actionTrainSnn(continuous){
+  if (CLASSES.length<2){ log('Add at least 2 classes first.'); return; }
+  const tag = continuous ? 'SNN-auto' : 'SNN';
+  const { trainingData, counts } = await buildTrainingList();
+  log(`[${tag}] Images found: ` + CLASSES.map((c,i)=>`${c.label}=${counts[i]}${counts[i]===0?'(empty)':''}`).join(' '));
+  if (trainingData.length===0){ log(`[${tag}] No training images - collect some first.`); return; }
+  log(`[${tag}] Note: SNN training is heavier than ANN (${SNN_TIMESTEPS} real frames per clip) - lower resolution, grayscale, or fewer timesteps/frames train faster.`);
+  const { valData, trainData } = splitValidation(trainingData);
+  log(`[${tag}] Training on ${trainData.length} images, holding out ${valData.length} for validation.`);
+  stopRequested = false;
+  showProgress(true);
+  if (!continuous){
+    const res = await trainSnnOnce(trainData, valData, tag);
+    if (res.aborted) log(`[${tag}] Stopped - nothing saved for this run.`);
+    showProgress(false); return;
+  }
+  let loopNo=0, savedLoops=0;
+  while (!stopRequested){
+    loopNo++;
+    log(`[SNN-auto] ---- Loop ${loopNo} starting ----`);
+    const res = await trainSnnOnce(trainData, valData, tag);
+    if (res.aborted){ log(`[SNN-auto] Stopped. Loop ${loopNo} discarded. ${savedLoops} loop(s) saved.`); break; }
+    savedLoops++;
+    log(`[SNN-auto] Loop ${loopNo} complete (${savedLoops} saved so far).`);
+  }
+  showProgress(false);
+}
+
+// ======================================================================
+// LIVE INFERENCE
+// ======================================================================
+function showPrediction(probs){
+  let pred=0; for (let i=1;i<ARCH.NUM_CLASSES;i++) if (probs[i]>probs[pred]) pred=i;
+  const el = document.getElementById('predBanner');
+  el.classList.remove('hidden');
+  el.textContent = `${CLASSES[pred].label} (${(probs[pred]*100).toFixed(0)}%)`;
+}
+async function actionInferAnn(){
+  if (!Ann.trained){ log('[ANN] No trained weights yet - train first, or upload myWeights.bin.'); return; }
+  if (!cameraEnabled){ log('Enable the camera first.'); return; }
+  stopRequested = false;
+  log('[ANN] Live inference running. Tap STOP to return.');
+  let frameCount=0;
+  while (!stopRequested){
+    const t0 = performance.now();
+    const buf = captureLiveInputBuffer();
+    annForward(buf);
+    showPrediction(denseOutput);
+    renderHeatmap(computeAnnHeatmap());
+    frameCount++;
+    if (verboseInfer) log(`[ANN] #${frameCount} ${(performance.now()-t0).toFixed(0)}ms probs: `+Array.from(denseOutput).map((p,i)=>`${CLASSES[i].label}=${(p*100).toFixed(0)}%`).join(' '));
+    await sleep(50);
+  }
+  log(`[ANN] Exiting after ${frameCount} frames.`);
+}
+async function actionInferSnn(){
+  if (!Snn.trained){ log('[SNN] No trained weights yet - train first, or upload mySnnWeights.bin.'); return; }
+  if (!cameraEnabled){ log('Enable the camera first.'); return; }
+  stopRequested = false;
+  log(`[SNN] Live inference running (reading the last ${SNN_TIMESTEPS} real frames as they arrive). Tap STOP to return.`);
+  let frameCount=0;
+  // Rolling window of the most recent SNN_TIMESTEPS real camera frames -
+  // this is what makes live SNN inference genuinely temporal: every tick
+  // classifies the actual recent motion, not one frozen snapshot re-rolled.
+  let window = [];
+  while (!stopRequested){
+    const t0 = performance.now();
+    const buf = captureLiveInputBuffer();
+    window.push(buf);
+    if (window.length>SNN_TIMESTEPS) window.shift();
+    // Until the window fills up, pad the front by repeating the oldest
+    // frame we have, so early ticks still get a full-length input.
+    const frames = window.length===SNN_TIMESTEPS ? window
+      : Array.from({length:SNN_TIMESTEPS}, (_,i)=>window[Math.max(0, i-(SNN_TIMESTEPS-window.length))]);
+    snnForward(frames, true);
+    showPrediction(denseOutputSnn);
+    renderHeatmap(computeSnnHeatmap());
+    frameCount++;
+    if (verboseInfer) log(`[SNN] #${frameCount} ${(performance.now()-t0).toFixed(0)}ms probs: `+Array.from(denseOutputSnn).map((p,i)=>`${CLASSES[i].label}=${(p*100).toFixed(0)}%`).join(' '));
+    await sleep(CLIP_FRAME_INTERVAL_MS);
+  }
+  log(`[SNN] Exiting after ${frameCount} frames.`);
+}
+
+// ======================================================================
+// STATUS
+// ======================================================================
+async function printStatus(){
+  let s = '=== STATUS ===\n';
+  s += `Architecture: ${INPUT_SIZE}x${INPUT_SIZE}x${NUM_CHANNELS}, ${CLASSES.length} class(es)\n`;
+  s += 'Clips per class: ';
+  for (let c=0;c<CLASSES.length;c++) s += `${CLASSES[c].label}=${await Store.countSamples(c)} `;
+  s += `\nANN: trained=${Ann.trained} freeze conv1=${Ann.freezeConv1} conv2=${Ann.freezeConv2} output=${Ann.freezeOutput} adamStep=${Ann.adamStep}`;
+  s += `\nSNN: trained=${Snn.trained} freeze conv1=${Snn.freezeConv1} conv2=${Snn.freezeConv2} output=${Snn.freezeOutput} adamStep=${Snn.adamStep}`;
+  s += `\nTraining: lr=${LEARNING_RATE} batch=${BATCH_SIZE} epochs/loop=${TARGET_EPOCHS} valSamples=${VALIDATION_SAMPLES}`;
+  s += `\nSNN params: SNN_TIMESTEPS=${SNN_TIMESTEPS} LIF_LEAK=${LIF_LEAK} LIF_THRESHOLD=${LIF_THRESHOLD} SNN_TRACE_LEAK=${SNN_TRACE_LEAK} CLIP_FRAME_INTERVAL_MS=${CLIP_FRAME_INTERVAL_MS}`;
+  s += `\nStorage: ${Store.mode==='fs' ? 'real folder ('+(Store.rootHandle?Store.rootHandle.name:'?')+')' : 'in-browser (IndexedDB) - use Export for real files'}`;
+  s += '\n==============';
+  log(s);
+}
+function updateDeviceSettingsPanel(){
+  const lines = [
+    `Classes (${CLASSES.length}): ${CLASSES.map(c=>c.label).join(', ')}`,
+    `  -> SD folders (auto-sanitized, same rule the firmware uses): ${CLASSES.map(c=>c.folder).join(', ')}`,
+    `Input size: ${INPUT_SIZE}x${INPUT_SIZE}, ${NUM_CHANNELS===1?'grayscale':'RGB'} (${NUM_CHANNELS} channel${NUM_CHANNELS===1?'':'s'})`,
+    `SNN timesteps / frames per clip: ${SNN_TIMESTEPS}`,
+    `LIF leak: ${LIF_LEAK}   LIF threshold: ${LIF_THRESHOLD}   Trace leak: ${SNN_TRACE_LEAK}`,
+    `Clip frame interval: ${CLIP_FRAME_INTERVAL_MS}ms`,
+    ``,
+    `This is exactly what's written to header/config.json - make sure that file`,
+    `(plus header/myWeights.bin, header/mySnnWeights.bin, and images/ if you want`,
+    `the device to see your training clips too) is on the SD card firmware-v004.ino`,
+    `boots from. No #defines to edit or reflash for a settings change - just update`,
+    `config.json on the card and reboot the device.`,
+  ];
+  document.getElementById('deviceSettings').value = lines.join('\n');
+}
+
+// ======================================================================
+// UI WIRING
+// ======================================================================
+function buildClassList(){
+  const el = document.getElementById('classList');
+  el.innerHTML = '';
+  if (CLASSES.length===0){ el.innerHTML = '<p class="small">No classes yet - add one below to get started.</p>'; return; }
+  Promise.all(CLASSES.map((c,i)=>Store.countSamples(i))).then(counts=>{
+    CLASSES.forEach((c,i)=>{
+      const row = document.createElement('div');
+      row.className = 'classRow';
+      row.innerHTML = `<span class="name">${c.label}</span><span class="badge">${counts[i]}</span>`;
+      row.querySelector('.name').onclick = ()=>openCollect(i);
+      el.appendChild(row);
+    });
+  });
+}
+async function addClass(){
+  const input = document.getElementById('newClassName');
+  const label = input.value.trim();
+  if (!label){ return; }
+  if (CLASSES.some(c=>c.label.toLowerCase()===label.toLowerCase())){ log('A class with that name already exists.'); return; }
+  CLASSES.push({ label, folder: sanitizeFolderName(label) });
+  input.value = '';
+  rebuildArchitecture();
+  await saveConfig();
+  buildClassList();
+  log(`Added class '${label}'. Both models were reset (class count changed).`);
+}
+async function deleteCurrentClass(){
+  if (collectClassIdx<0) return;
+  const label = CLASSES[collectClassIdx].label;
+  if (!confirm(`Delete class '${label}' and all its collected images? This cannot be undone.`)) return;
+  await Store.deleteClassData(collectClassIdx);
+  CLASSES.splice(collectClassIdx,1);
+  document.getElementById('collectPanel').classList.add('hidden');
+  rebuildArchitecture();
+  await saveConfig();
+  buildClassList();
+  log(`Deleted class '${label}'. Both models were reset (class count changed).`);
+}
+// Smallest input size that still leaves every layer with a positive size:
+// CONV2_OUT>=1 needs POOL1_OUT>=3, needs CONV1_OUT>=6, needs INPUT_SIZE>=8.
+function isValidInputSize(size){
+  if (!Number.isInteger(size) || size<8 || size>512) return false;
+  const conv1Out = size-(CONV1_KERNEL-1);
+  const pool1Out = Math.floor(conv1Out/2);
+  const conv2Out = pool1Out-(CONV2_KERNEL-1);
+  return conv2Out >= 1;
+}
+function refreshResolutionInput(){ document.getElementById('inpResolution').value = INPUT_SIZE; }
+async function applySettings(){
+  const newSize = parseInt(document.getElementById('inpResolution').value, 10);
+  const newChannels = document.getElementById('chkGrayscale').checked ? 1 : 3;
+  if (newSize===INPUT_SIZE && newChannels===NUM_CHANNELS) return;
+  if (!isValidInputSize(newSize)){
+    log(`${newSize} is too small (or invalid) for this architecture (3x3 conv, 2x2 pool, 3x3 conv needs at least 8px). Not applied.`);
+    refreshResolutionInput();
+    return;
+  }
+  if (!confirm(`Changing resolution/channels resets both models to fresh weights. Continue?`)) {
+    refreshResolutionInput();
+    document.getElementById('chkGrayscale').checked = (NUM_CHANNELS===1);
+    return;
+  }
+  INPUT_SIZE = newSize; NUM_CHANNELS = newChannels;
+  rebuildArchitecture();
+  await saveConfig();
+}
+function buildSettingsUI(){
+  const defs = [
+    ['Learning rate', ()=>LEARNING_RATE, v=>LEARNING_RATE=v, 0.0001],
+    ['Batch size', ()=>BATCH_SIZE, v=>BATCH_SIZE=Math.round(v), 1],
+    ['Epochs per loop', ()=>TARGET_EPOCHS, v=>TARGET_EPOCHS=Math.round(v), 1],
+    ['Validation images/class', ()=>VALIDATION_SAMPLES, v=>VALIDATION_SAMPLES=Math.round(v), 1],
+    ['SNN timesteps (= frames/clip)', ()=>SNN_TIMESTEPS, v=>{ SNN_TIMESTEPS=Math.round(v); allocSnnRecording(); updateDeviceSettingsPanel(); }, 1],
+    ['SNN LIF leak', ()=>LIF_LEAK, v=>{ LIF_LEAK=v; updateDeviceSettingsPanel(); }, 0.01],
+    ['SNN LIF threshold', ()=>LIF_THRESHOLD, v=>{ LIF_THRESHOLD=v; updateDeviceSettingsPanel(); }, 0.01],
+    ['SNN trace leak', ()=>SNN_TRACE_LEAK, v=>{ SNN_TRACE_LEAK=v; updateDeviceSettingsPanel(); }, 0.01],
+    ['Clip frame interval (ms)', ()=>CLIP_FRAME_INTERVAL_MS, v=>{ CLIP_FRAME_INTERVAL_MS=Math.round(v); updateDeviceSettingsPanel(); saveConfig(); }, 5],
+  ];
+  const grid = document.getElementById('settingsGrid');
+  grid.innerHTML = '';
+  for (const [label, get, set, step] of defs){
+    const lab = document.createElement('div'); lab.textContent = label;
+    const inp = document.createElement('input');
+    inp.type='number'; inp.step=step; inp.value=get();
+    inp.onchange = ()=>set(parseFloat(inp.value));
+    grid.appendChild(lab); grid.appendChild(inp);
+  }
+}
+function wireUI(){
+  videoEl = document.getElementById('videoEl');
+  document.getElementById('btnEnableCamera').onclick = enableCamera;
+  document.getElementById('btnSwitchCamera').onclick = switchCamera;
+  document.getElementById('btnApplySettings').onclick = applySettings;
+  document.getElementById('btnChooseFolder').onclick = async ()=>{ await Store.chooseFolder(); buildClassList(); };
+  document.getElementById('btnExportZip').onclick = exportAllZip;
+  document.getElementById('fileImportZip').onchange = async (e)=>{ if (e.target.files[0]){ setBusy(true); await importZipFile(e.target.files[0]); setBusy(false); e.target.value=''; } };
+
+  document.getElementById('btnAddClass').onclick = addClass;
+  document.getElementById('newClassName').addEventListener('keydown', (e)=>{ if (e.key==='Enter') addClass(); });
+
+  document.getElementById('btnCaptureOne').onclick = async ()=>{ setBusy(true); await captureOneClip(collectClassIdx); setBusy(false); };
+  document.getElementById('btnAutoCollect').onclick = async ()=>{ setBusy(true); await autoCollect(collectClassIdx, 5); setBusy(false); };
+  document.getElementById('fileImportImages').onchange = async (e)=>{ if (e.target.files.length){ setBusy(true); await importImageFilesForClass(collectClassIdx, Array.from(e.target.files)); setBusy(false); e.target.value=''; } };
+  document.getElementById('btnDeleteClass').onclick = async ()=>{ setBusy(true); await deleteCurrentClass(); setBusy(false); };
+  document.getElementById('btnToggleGallery').onclick = toggleGallery;
+  document.getElementById('btnCloseCollect').onclick = ()=>{
+    document.getElementById('collectPanel').classList.add('hidden');
+    document.getElementById('galleryGrid').classList.add('hidden');
+    galleryRevokeUrls();
+  };
+
+  document.getElementById('btnTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(false); setBusy(false); };
+  document.getElementById('btnAutoTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(true); setBusy(false); };
+  document.getElementById('btnInferAnn').onclick = async ()=>{ setBusy(true); await actionInferAnn(); setBusy(false); };
+  document.getElementById('btnTrainSnn').onclick = async ()=>{ setBusy(true); await actionTrainSnn(false); setBusy(false); };
+  document.getElementById('btnAutoTrainSnn').onclick = async ()=>{ setBusy(true); await actionTrainSnn(true); setBusy(false); };
+  document.getElementById('btnInferSnn').onclick = async ()=>{ setBusy(true); await actionInferSnn(); setBusy(false); };
+
+  document.getElementById('btnStop').onclick = ()=>{ stopRequested = true; };
+  document.getElementById('chkVerbose').onchange = (e)=>{ verboseInfer = e.target.checked; };
+  document.getElementById('chkHeatmap').onchange = (e)=>{ showHeatmap = e.target.checked; };
+  document.getElementById('btnStatus').onclick = printStatus;
+
+  document.getElementById('btnDownloadAnn').onclick = ()=>downloadWeightFile(ANN_WEIGHT_FILE);
+  document.getElementById('btnDownloadSnn').onclick = ()=>downloadWeightFile(SNN_WEIGHT_FILE);
+  document.getElementById('fileUploadAnn').onchange = async (e)=>{ if (e.target.files[0]){ await uploadWeightFile(ANN_WEIGHT_FILE, e.target.files[0]); e.target.value=''; } };
+  document.getElementById('fileUploadSnn').onchange = async (e)=>{ if (e.target.files[0]){ await uploadWeightFile(SNN_WEIGHT_FILE, e.target.files[0]); e.target.value=''; } };
+
+  document.getElementById('frzAnnC1').onchange = e=>Ann.freezeConv1=e.target.checked;
+  document.getElementById('frzAnnC2').onchange = e=>Ann.freezeConv2=e.target.checked;
+  document.getElementById('frzAnnOut').onchange = e=>Ann.freezeOutput=e.target.checked;
+  document.getElementById('frzSnnC1').onchange = e=>Snn.freezeConv1=e.target.checked;
+  document.getElementById('frzSnnC2').onchange = e=>Snn.freezeConv2=e.target.checked;
+  document.getElementById('frzSnnOut').onchange = e=>Snn.freezeOutput=e.target.checked;
+
+  document.getElementById('btnCopyDeviceSettings').onclick = ()=>{
+    navigator.clipboard.writeText(document.getElementById('deviceSettings').value).then(()=>log('Copied device settings.'));
+  };
+}
+
+// ======================================================================
+// INIT
+// ======================================================================
+window.addEventListener('DOMContentLoaded', async ()=>{
+  wireUI();
+  await Store.init();
+  await loadConfig();
+  refreshResolutionInput();
+  document.getElementById('chkGrayscale').checked = (NUM_CHANNELS===1);
+  rebuildArchitecture();
+  const annLoaded = await annLoadWeights();
+  const snnLoaded = await snnLoadWeights();
+  buildClassList();
+  buildSettingsUI();
+  log('Ready. ' + (annLoaded?'ANN weights loaded. ':'No ANN weights yet. ') + (snnLoaded?'SNN weights loaded.':'No SNN weights yet.'));
+  log('1) Enable Camera  2) Add a class (or two)  3) tap a class name to collect images  4) Train.');
+});
+</script>
+</body>
+</html>

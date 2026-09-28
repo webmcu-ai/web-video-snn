@@ -1,0 +1,10 @@
+{
+  "classes": ["1Unknown", "2MovingHand", "3MovingFace"],
+  "inputSize": 64,
+  "numChannels": 3,
+  "snnTimesteps": 16,
+  "lifLeak": 0.90,
+  "lifThreshold": 0.50,
+  "snnTraceLeak": 0.95,
+  "clipFrameIntervalMs": 80
+}
