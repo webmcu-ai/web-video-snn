@@ -59,6 +59,12 @@ and SNN_TIMESTEPS (now also "frames per clip") are all adjustable here -
 changing any of them changes the model's size, so it resets both models to
 fresh weights (same as changing config.json and rebooting the device).
 
+SMALL FOLLOW-UP FIXES (still v004): a pulsing red dot next to the Collect
+title shows while a clip is actively recording (captureClipJpegs()), and a
+"View/Delete Clips" button in Collect shows a thumbnail grid of that class's
+clips with a per-clip delete button (Store.deleteClip()) - the thumbnail is
+each clip's middle frame.
+
 STORAGE: same pattern as the motion trainer - a real folder via the File
 System Access API where supported (Android Chrome/desktop Chrome), or
 in-browser IndexedDB with Export/Import (.zip) elsewhere (iOS Safari).
@@ -129,7 +135,15 @@ own risk! MIT license.
   .videoWrap{position:relative; display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap;}
   video{width:100%; max-width:280px; border-radius:12px; background:#000; aspect-ratio:1/1; object-fit:cover;}
   canvas.heatmap{width:100%; max-width:280px; border-radius:12px; image-rendering:pixelated; background:#000;}
-  .predBanner{font-size:1.3rem; font-weight:700; text-align:center; padding:8px; border-radius:10px; background:var(--panel2); margin-top:8px;}
+  .predBanner{font-size:1.3rem; font-weight:700; text-align:center; padding:8px; border-radius:10px; background:var(--panel2); margin-top:8px;}  .recDot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--danger);margin-left:8px;vertical-align:middle;animation:recPulse 1s infinite;}
+  .recDot.hidden{display:none;}
+  @keyframes recPulse{0%,100%{opacity:1;}50%{opacity:0.25;}}
+  .galleryGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin-top:10px;}
+  .galleryGrid.hidden{display:none;}
+  .galleryItem{position:relative;background:var(--panel2);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+  .galleryItem img{display:block;width:100%;aspect-ratio:1;object-fit:cover;}
+  .galleryItem .cap{font-size:10px;color:var(--muted);padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .galleryItem .del{position:absolute;top:2px;right:2px;background:var(--danger);color:#fff;border:none;border-radius:50%;width:20px;height:20px;line-height:20px;text-align:center;cursor:pointer;font-size:13px;padding:0;}
 </style>
 </head>
 <body>
@@ -154,20 +168,23 @@ own risk! MIT license.
   </div>
 
   <div class="card hidden" id="collectPanel">
-    <h2 id="collectTitle">Collect</h2>
+    <h2><span id="collectTitleText">Collect</span> <span id="recIndicator" class="recDot hidden" title="Recording..."></span></h2>
     <p class="small" id="collectCount"></p>
     <div class="row">
       <button id="btnCaptureOne" class="primary">Capture Clip</button>
       <button id="btnAutoCollect" class="good">Auto x5 Clips</button>
       <label class="btn" for="fileImportImages" style="display:inline-flex;">Import Images&hellip;</label>
       <input type="file" id="fileImportImages" accept="image/*" multiple class="hidden">
+      <button id="btnToggleGallery">View/Delete Clips</button>
       <button id="btnDeleteClass" class="danger">Delete Class</button>
       <button id="btnCloseCollect">Close</button>
     </div>
     <p class="small">A "clip" is <span id="clipFrameCountLabel"></span> real, sequential frames grabbed
     a beat apart - hold the pose/motion steady (or moving, if that's the point) while it records. The
     camera feed above stays live so you can see exactly what you're about to capture. "Import Images"
-    still works for single stills - each one becomes its own repeated-frame clip.</p>
+    still works for single stills - each one becomes its own repeated-frame clip. The red dot above means
+    a clip is recording right now - don't move the camera or change the pose until it clears.</p>
+    <div id="galleryGrid" class="galleryGrid hidden"></div>
   </div>
 
   <div class="card" id="setupCard">
@@ -512,6 +529,21 @@ const Store = {
       for (const k of keys) await idbDelete(k);
     }
   },
+  // Deletes ONE clip (clip.name from listSamples()) - either a clip_x/
+  // subfolder of frames, or a single loose v002-style still.
+  async deleteClip(classIdx, clipName){
+    if (this.mode==='fs' && this.rootHandle){
+      try {
+        const dir = await this._classDir(classIdx, false);
+        await dir.removeEntry(clipName, {recursive:true}); // works for both a subfolder and a lone file
+      } catch(e){}
+    } else {
+      const base = `images/${CLASSES[classIdx].folder}/${clipName}`;
+      await idbDelete(base); // loose still, if that's what this is
+      const nested = await idbKeys(base+'/');
+      for (const k of nested) await idbDelete(k); // clip subfolder's frames
+    }
+  },
   async writeWeightFile(name, data){
     if (this.mode==='fs' && this.rootHandle){
       const hdr = await this.rootHandle.getDirectoryHandle('header', {create:true});
@@ -759,13 +791,22 @@ async function captureSquareJpeg(){
 // Captures a short real video clip: `count` sequential JPEG frames,
 // `intervalMs` apart. This IS the "real time axis" v002 didn't have -
 // each frame is a genuinely different moment, not a re-sample of one photo.
+function setRecordingIndicator(on){
+  const el = document.getElementById('recIndicator');
+  if (el) el.classList.toggle('hidden', !on);
+}
 async function captureClipJpegs(count, intervalMs){
-  const frames = [];
-  for (let i=0;i<count;i++){
-    frames.push(await captureSquareJpeg());
-    if (i<count-1) await sleep(intervalMs);
+  setRecordingIndicator(true);
+  try {
+    const frames = [];
+    for (let i=0;i<count;i++){
+      frames.push(await captureSquareJpeg());
+      if (i<count-1) await sleep(intervalMs);
+    }
+    return frames;
+  } finally {
+    setRecordingIndicator(false);
   }
-  return frames;
 }
 function fillInputBufferFromImageData(imgData, buf){
   const n = INPUT_SIZE*INPUT_SIZE;
@@ -1276,13 +1317,17 @@ function openCollect(classIdx){
   collectClassIdx = classIdx;
   document.getElementById('collectPanel').classList.remove('hidden');
   document.getElementById('cameraCard').scrollIntoView({ behavior:'smooth', block:'start' });
+  document.getElementById('galleryGrid').classList.add('hidden');
+  galleryRevokeUrls();
   refreshCollectCount();
 }
 async function refreshCollectCount(){
   const n = await Store.countSamples(collectClassIdx);
-  document.getElementById('collectTitle').textContent = `Collect: ${CLASSES[collectClassIdx].label}`;
+  document.getElementById('collectTitleText').textContent = `Collect: ${CLASSES[collectClassIdx].label}`;
   document.getElementById('collectCount').textContent = `${n} clip(s) saved so far.`;
   document.getElementById('clipFrameCountLabel').textContent = SNN_TIMESTEPS;
+  const grid = document.getElementById('galleryGrid');
+  if (!grid.classList.contains('hidden')) await refreshGallery();
 }
 async function captureOneClip(classIdx){
   if (!cameraEnabled){ log('Enable the camera first.'); return; }
@@ -1302,6 +1347,50 @@ async function autoCollect(classIdx, count){
     await sleep(600);
   }
   log(`[Collect] Auto-collect complete: ${count} new clips.`);
+}
+
+// ======================================================================
+// GALLERY - view captured clips for the class currently open in Collect,
+// with a delete button per clip. Thumbnail is the clip's middle frame.
+// ======================================================================
+let _galleryUrls = [];
+function galleryRevokeUrls(){
+  for (const u of _galleryUrls) URL.revokeObjectURL(u);
+  _galleryUrls = [];
+}
+async function refreshGallery(){
+  const grid = document.getElementById('galleryGrid');
+  galleryRevokeUrls();
+  grid.innerHTML = '';
+  const clips = await Store.listSamples(collectClassIdx);
+  if (!clips.length){ grid.innerHTML = '<p class="small">No clips yet.</p>'; return; }
+  for (const clip of clips){
+    const thumbBlob = clip.frames[Math.floor((clip.frames.length-1)/2)];
+    const url = URL.createObjectURL(thumbBlob);
+    _galleryUrls.push(url);
+    const item = document.createElement('div');
+    item.className = 'galleryItem';
+    const img = document.createElement('img'); img.src = url; img.alt = clip.name;
+    const cap = document.createElement('div'); cap.className = 'cap';
+    cap.textContent = clip.frames.length>1 ? `${clip.frames.length} frames` : 'still';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '\u00d7';
+    del.title = 'Delete this clip';
+    del.onclick = async (e)=>{
+      e.stopPropagation();
+      if (!confirm(`Delete this clip (${clip.frames.length} frame${clip.frames.length>1?'s':''}) for '${CLASSES[collectClassIdx].label}'? This can't be undone.`)) return;
+      await Store.deleteClip(collectClassIdx, clip.name);
+      log(`[Gallery] Deleted clip '${clip.name}' from '${CLASSES[collectClassIdx].label}'.`);
+      await refreshCollectCount(); // also re-runs refreshGallery since the grid is visible
+      buildClassList();
+    };
+    item.appendChild(img); item.appendChild(cap); item.appendChild(del);
+    grid.appendChild(item);
+  }
+}
+function toggleGallery(){
+  const grid = document.getElementById('galleryGrid');
+  const hidden = grid.classList.toggle('hidden');
+  if (!hidden) refreshGallery(); else galleryRevokeUrls();
 }
 
 // ======================================================================
@@ -1685,7 +1774,12 @@ function wireUI(){
   document.getElementById('btnAutoCollect').onclick = async ()=>{ setBusy(true); await autoCollect(collectClassIdx, 5); setBusy(false); };
   document.getElementById('fileImportImages').onchange = async (e)=>{ if (e.target.files.length){ setBusy(true); await importImageFilesForClass(collectClassIdx, Array.from(e.target.files)); setBusy(false); e.target.value=''; } };
   document.getElementById('btnDeleteClass').onclick = async ()=>{ setBusy(true); await deleteCurrentClass(); setBusy(false); };
-  document.getElementById('btnCloseCollect').onclick = ()=>{ document.getElementById('collectPanel').classList.add('hidden'); };
+  document.getElementById('btnToggleGallery').onclick = toggleGallery;
+  document.getElementById('btnCloseCollect').onclick = ()=>{
+    document.getElementById('collectPanel').classList.add('hidden');
+    document.getElementById('galleryGrid').classList.add('hidden');
+    galleryRevokeUrls();
+  };
 
   document.getElementById('btnTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(false); setBusy(false); };
   document.getElementById('btnAutoTrainAnn').onclick = async ()=>{ setBusy(true); await actionTrainAnn(true); setBusy(false); };
