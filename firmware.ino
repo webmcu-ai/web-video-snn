@@ -21,9 +21,11 @@
 //        "numChannels": 3, "snnTimesteps": 16, "lifLeak": 0.9,
 //        "lifThreshold": 0.5, "snnTraceLeak": 0.95,
 //        "clipFrameIntervalMs": 80 }
-//    If config.json is missing, a 2-class placeholder config is used so the
-//    menu still boots, and both weight loads will very likely fail their
-//    size check below - go collect classes and export from the browser.
+//    If config.json is missing, the built-in default (classes 1Unknown,
+//    2MovingHand, 3MovingFace, 64x64 RGB, 16 timesteps, leak 0.90,
+//    threshold 0.50, trace leak 0.95, 80ms) is used AND written to
+//    /header/config.json on the SD card, so there's a real file to edit.
+//    Weight loads still need matching .bin files from the browser.
 //
 // 2) COLLECTS AND CLASSIFIES REAL VIDEO CLIPS, NOT SINGLE STILLS.
 //    Collection (menu items 1..N) now records a whole CLIP per tap -
@@ -235,6 +237,8 @@ uint8_t* mySnnC2Spike = nullptr;    // [FLATTENED_SIZE]
 // ---- Rolling window of real camera frames for video SNN inference ----
 float** mySnnWindow = nullptr;      // [SNN_TIMESTEPS] pointers, each [INPUT_N] floats - a circular buffer
 int mySnnWindowFilled = 0, mySnnWindowNext = 0;
+bool mySnnVerbose = true;           // true: print every timestep + timing; false: final result only. Toggle with 'v' in Infer SNN.
+float* mySnnStepProbs = nullptr;    // [NUM_CLASSES] scratch for the per-timestep running softmax (verbose mode)
 
 // ======================================================
 // UTILITY FUNCTIONS
@@ -309,15 +313,31 @@ String mySanitizeFolderName(const String &label) {
   return out;
 }
 void myApplyFallbackConfig() {
-  myClassLabels = { "classA", "classB" };
-  myClassFolders = { "classA", "classB" };
-  NUM_CLASSES = 2; myTotalItems = NUM_CLASSES + 2;
+  myClassLabels = { "1Unknown", "2MovingHand", "3MovingFace" };
+  myClassFolders.clear();
+  for (auto &l : myClassLabels) myClassFolders.push_back(mySanitizeFolderName(l));
+  NUM_CLASSES = myClassLabels.size(); myTotalItems = NUM_CLASSES + 2;
   INPUT_SIZE = 64; NUM_CHANNELS = 3;
   SNN_TIMESTEPS = 16; LIF_LEAK = 0.90f; LIF_THRESHOLD = 0.50f; SNN_TRACE_LEAK = 0.95f;
   CLIP_FRAME_INTERVAL_MS = 80;
-  Serial.println("WARNING: no " CONFIG_PATH " found - using a placeholder 2-class config.");
-  Serial.println("Collect classes + Export All (.zip) in index-v004.html, put config.json (and");
-  Serial.println("header/, images/) on this SD card, then reboot.");
+  Serial.println("No " CONFIG_PATH " found - using the built-in default config (1Unknown, 2MovingHand, 3MovingFace).");
+}
+// Writes the default config to the SD card as a real config.json the first
+// time the device boots without one, so there's a file on the card to look
+// at, edit, or replace with the browser's export. Same shape the browser
+// writes. Does nothing if a config.json already exists.
+void myWriteDefaultConfigIfMissing() {
+  if (!mySDavailable || SD.exists(CONFIG_PATH)) return;
+  if (!SD.exists("/header")) SD.mkdir("/header");
+  File f = SD.open(CONFIG_PATH, FILE_WRITE);
+  if (!f) { Serial.println("Could not write default " CONFIG_PATH); return; }
+  f.print("{\n  \"classes\": [");
+  for (int i = 0; i < NUM_CLASSES; i++) { f.print(i ? ", " : ""); f.print("\"" + myClassLabels[i] + "\""); }
+  f.printf("],\n  \"inputSize\": %d,\n  \"numChannels\": %d,\n  \"snnTimesteps\": %d,\n", INPUT_SIZE, NUM_CHANNELS, SNN_TIMESTEPS);
+  f.printf("  \"lifLeak\": %.2f,\n  \"lifThreshold\": %.2f,\n  \"snnTraceLeak\": %.2f,\n  \"clipFrameIntervalMs\": %d\n}\n",
+           LIF_LEAK, LIF_THRESHOLD, SNN_TRACE_LEAK, CLIP_FRAME_INTERVAL_MS);
+  f.close();
+  Serial.println("Wrote default " CONFIG_PATH " to the SD card - edit it or replace it with the browser's export.");
 }
 bool myLoadConfig() {
   if (!mySDavailable || !SD.exists(CONFIG_PATH)) return false;
@@ -437,6 +457,7 @@ void myAllocateMemory() {
   mySnnOutput_w = (float*)ps_malloc(OUTPUT_WEIGHTS * sizeof(float));
   mySnnOutput_b = (float*)ps_malloc(NUM_CLASSES * sizeof(float));
   mySnnDense_output = (float*)ps_malloc(NUM_CLASSES*sizeof(float));
+  mySnnStepProbs = (float*)ps_malloc(NUM_CLASSES*sizeof(float));
 
   mySnnC1Mem      = (float*)ps_calloc(CONV1_FILTERS*CONV1_OUTPUT_SIZE*CONV1_OUTPUT_SIZE, sizeof(float));
   mySnnC2Mem      = (float*)ps_calloc(CONV2_FILTERS*CONV2_OUTPUT_SIZE*CONV2_OUTPUT_SIZE, sizeof(float));
@@ -563,7 +584,7 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_WARN);
   esp_log_level_set("esp_camera", ESP_LOG_ERROR);
 
-  if (!myLoadConfig()) myApplyFallbackConfig();
+  if (!myLoadConfig()) { myApplyFallbackConfig(); myWriteDefaultConfigIfMissing(); }
   myComputeArchitecture();
   myBuildResizeLookup();
   myAllocateMemory();
@@ -676,7 +697,7 @@ void myCaptureClip(const String &classPath, int clipDisplayNumber) {
   for (int i = 0; i < SNN_TIMESTEPS; i++) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) { Serial.println("  frame grab failed mid-clip"); continue; }
-    char fname[8]; snprintf(fname, sizeof(fname), "/f%02d.jpg", i);
+    char fname[16]; snprintf(fname, sizeof(fname), "/f%02d.jpg", i); // was char fname[8] - too small for "/fNN.jpg\0" (9 bytes), truncated to "/fNN.jp"
     File file = SD.open(clipPath + String(fname), FILE_WRITE);
     if (file) { file.write(fb->buf, fb->len); file.close(); }
     if (i == SNN_TIMESTEPS - 1) myDisplayImageOnOLED(fb, clipDisplayNumber);
@@ -864,6 +885,7 @@ void mySnnForwardInfer() {
   memset(mySnnTrace, 0, NUM_CLASSES*sizeof(float));
 
   for (int t=0; t<SNN_TIMESTEPS; t++) {
+    unsigned long stepStartUs = mySnnVerbose ? micros() : 0;
     float* frame = ordered[t];
 
     // 1) rate-code this REAL frame into a fresh Bernoulli spike frame
@@ -924,6 +946,24 @@ void mySnnForwardInfer() {
       float current = mySnnOutput_b[c];
       for (int i=0;i<FLATTENED_SIZE;i++) current += mySnnC2Spike[i]*mySnnOutput_w[c*FLATTENED_SIZE+i];
       mySnnTrace[c] = mySnnTrace[c]*SNN_TRACE_LEAK + current;
+    }
+
+    // Verbose: running softmax of the trace SO FAR plus this step's cost, so
+    // you can watch the decision form. Display only - it never stops the run
+    // early (see the header comment).
+    if (mySnnVerbose) {
+      memcpy(mySnnStepProbs, mySnnTrace, NUM_CLASSES*sizeof(float));
+      float mxS = mySnnStepProbs[0]; for (int i=1;i<NUM_CLASSES;i++) mxS = max(mxS, mySnnStepProbs[i]);
+      float esS = 0; for (int i=0;i<NUM_CLASSES;i++) esS += exp(mySnnStepProbs[i]-mxS);
+      int best = 0;
+      for (int i=0;i<NUM_CLASSES;i++) mySnnStepProbs[i] = exp(mySnnStepProbs[i]-mxS)/esS;
+      for (int i=1;i<NUM_CLASSES;i++) if (mySnnStepProbs[i] > mySnnStepProbs[best]) best = i;
+      int spikes1 = 0, spikes2 = 0;
+      for (int i=0;i<CONV1_FILTERS*CONV1_OUTPUT_SIZE*CONV1_OUTPUT_SIZE;i++) spikes1 += mySnnC1Spike[i];
+      for (int i=0;i<FLATTENED_SIZE;i++) spikes2 += mySnnC2Spike[i];
+      Serial.printf("    [SNN t=%2d/%d] %5lums  conv1 spikes=%d conv2 spikes=%d  leading: %s p=%.2f\n",
+                    t+1, SNN_TIMESTEPS, (micros()-stepStartUs)/1000UL, spikes1, spikes2,
+                    myClassLabels[best].c_str(), mySnnStepProbs[best]);
     }
   }
 
@@ -992,20 +1032,37 @@ void myActionInferSnn() {
     u8g2.firstPage(); do { u8g2.drawStr(0,12,"No SNN weights"); u8g2.drawStr(0,24,"See browser"); } while (u8g2.nextPage());
     delay(2500); myResetMenuState(); return;
   }
-  Serial.println("\n>>> Infer SNN (real video - rolling window, full SNN_TIMESTEPS every tick, no early exit). Serial/touch: t or l = exit");
+  Serial.println("\n>>> Infer SNN (real video - rolling window, full SNN_TIMESTEPS every tick, no early exit).");
+  Serial.println("    Serial: 'v' = toggle verbose (per-timestep prints) / final result only,  't' or 'l' = exit");
   Serial.printf("    SNN_TIMESTEPS=%d LIF_LEAK=%.2f LIF_THRESHOLD=%.2f SNN_TRACE_LEAK=%.2f CLIP_FRAME_INTERVAL_MS=%d (from config.json)\n",
                 SNN_TIMESTEPS, LIF_LEAK, LIF_THRESHOLD, SNN_TRACE_LEAK, CLIP_FRAME_INTERVAL_MS);
+  Serial.printf("    Verbose is %s. The first %d ticks fill the window (padded with the oldest frame), so a fully\n"
+                "    real-video decision needs ~%d ticks - that fill time, not one slow pass, is most of any long delay.\n",
+                mySnnVerbose ? "ON" : "OFF", SNN_TIMESTEPS, SNN_TIMESTEPS);
   myResetTouchState();
   mySnnWindowFilled = 0; mySnnWindowNext = 0; // start the window fresh each time inference mode is entered
-  int frameCount = 0;
+  int frameCount = 0, tick = 0;
   while (true) {
-    if (Serial.available()) { char c = Serial.read(); if (c=='t'||c=='T'||c=='l'||c=='L') { myResetMenuState(); return; } }
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c=='t'||c=='T'||c=='l'||c=='L') { myResetMenuState(); return; }
+      if (c=='v'||c=='V') { mySnnVerbose = !mySnnVerbose; Serial.printf("    Verbose %s\n", mySnnVerbose ? "ON" : "OFF"); }
+    }
     unsigned long t0 = millis();
-    if (myCaptureAndPreprocess(mySnnWindow[mySnnWindowNext])) {
+    bool ok = myCaptureAndPreprocess(mySnnWindow[mySnnWindowNext]);
+    unsigned long capMs = millis() - t0;
+    if (ok) {
       mySnnWindowNext = (mySnnWindowNext + 1) % SNN_TIMESTEPS;
       if (mySnnWindowFilled < SNN_TIMESTEPS) mySnnWindowFilled++;
+      tick++;
+      if (mySnnVerbose) Serial.printf("  [SNN tick %d] window %d/%d real frames, capture %lums, running %d timesteps...\n",
+                                      tick, mySnnWindowFilled, SNN_TIMESTEPS, capMs, SNN_TIMESTEPS);
+      unsigned long t1 = millis();
       mySnnForwardInfer();
+      unsigned long infMs = millis() - t1;
       myShowInferenceResult("SNN", mySnnDense_output, millis()-t0);
+      if (mySnnVerbose) Serial.printf("    capture=%lums inference=%lums total=%lums%s\n", capMs, infMs, millis()-t0,
+                                      mySnnWindowFilled < SNN_TIMESTEPS ? "  (window still filling)" : "");
     }
     frameCount++;
     if (frameCount >= 5) {
