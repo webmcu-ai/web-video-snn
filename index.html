@@ -63,7 +63,13 @@ SMALL FOLLOW-UP FIXES (still v004): a pulsing red dot next to the Collect
 title shows while a clip is actively recording (captureClipJpegs()), and a
 "View/Delete Clips" button in Collect shows a thumbnail grid of that class's
 clips with a per-clip delete button (Store.deleteClip()) - the thumbnail is
-each clip's middle frame.
+each clip's middle frame. Double-click a thumbnail (or tap its corner button)
+to see all of that clip's frames; deleting there still removes the whole clip.
+Clips now show a camera overlay: optional "get ready" countdown
+(clipCountdownSec), then a red frame with REC n/N and a progress bar, then a
+green "CLIP SAVED". Frames are scheduled at clipFrameIntervalMs from the
+clip's start, so capture time no longer stretches the spacing, and the actual
+clip duration is logged.
 
 STORAGE: same pattern as the motion trainer - a real folder via the File
 System Access API where supported (Android Chrome/desktop Chrome), or
@@ -137,6 +143,25 @@ own risk! MIT license.
   canvas.heatmap{width:100%; max-width:280px; border-radius:12px; image-rendering:pixelated; background:#000;}
   .predBanner{font-size:1.3rem; font-weight:700; text-align:center; padding:8px; border-radius:10px; background:var(--panel2); margin-top:8px;}  .recDot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--danger);margin-left:8px;vertical-align:middle;animation:recPulse 1s infinite;}
   .recDot.hidden{display:none;}
+  .videoBox{position:relative;width:100%;max-width:280px;}
+  .recOverlay{position:absolute;inset:0;border-radius:12px;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;box-sizing:border-box;}
+  .recOverlay.hidden{display:none;}
+  .recOverlay.countdown{box-shadow:inset 0 0 0 4px #f1c40f;}
+  .recOverlay.recording{box-shadow:inset 0 0 0 4px var(--danger);}
+  .recOverlay.done{box-shadow:inset 0 0 0 4px #2ecc71;}
+  .recBadge{align-self:flex-start;margin:8px;padding:2px 8px;border-radius:6px;font-weight:700;font-size:.85rem;color:#fff;background:var(--danger);}
+  .recOverlay.done .recBadge{background:#2ecc71;}
+  .recOverlay.countdown .recBadge{background:#f1c40f;color:#000;}
+  .recCount{margin:auto;font-size:4.5rem;font-weight:800;color:#fff;text-shadow:0 0 8px #000;}
+  .recBar{height:8px;background:rgba(0,0,0,.5);margin:0 8px 8px;border-radius:4px;overflow:hidden;}
+  .recBar>div{height:100%;width:0;background:var(--danger);}
+  .viewerBack{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;overflow:auto;padding:12px;}
+  .viewerBack.hidden{display:none;}
+  .viewerGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px;margin:10px 0;}
+  .viewerGrid figure{margin:0;position:relative;}
+  .viewerGrid img{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;}
+  .viewerGrid figcaption{position:absolute;left:3px;bottom:3px;font-size:10px;background:rgba(0,0,0,.6);color:#fff;padding:0 4px;border-radius:3px;}
+  .galleryItem .view{position:absolute;right:2px;bottom:18px;background:rgba(0,0,0,.6);color:#fff;border:none;border-radius:4px;font-size:12px;padding:0 5px;cursor:pointer;}
   @keyframes recPulse{0%,100%{opacity:1;}50%{opacity:0.25;}}
   .galleryGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin-top:10px;}
   .galleryGrid.hidden{display:none;}
@@ -156,7 +181,14 @@ own risk! MIT license.
   <div class="card" id="cameraCard">
     <h2>Camera</h2>
     <div class="videoWrap">
-      <video id="videoEl" autoplay muted playsinline></video>
+      <div class="videoBox">
+        <video id="videoEl" autoplay muted playsinline></video>
+        <div id="recOverlay" class="recOverlay hidden">
+          <div id="recBadge" class="recBadge"></div>
+          <div id="recCount" class="recCount"></div>
+          <div class="recBar"><div id="recBarFill"></div></div>
+        </div>
+      </div>
       <canvas id="heatmapCanvas" class="heatmap" width="64" height="64"></canvas>
     </div>
     <div class="row" style="margin-top:8px;">
@@ -282,6 +314,17 @@ own risk! MIT license.
     <div class="row" style="margin-top:8px;"><button id="btnCopyDeviceSettings">Copy</button></div>
   </details>
 
+  <div id="clipViewer" class="viewerBack hidden">
+    <div class="card">
+      <h2 id="viewerTitle">Clip</h2>
+      <div class="row">
+        <button id="btnViewerDelete" class="danger">Delete whole clip</button>
+        <button id="btnViewerClose">Close</button>
+      </div>
+      <div id="viewerGrid" class="viewerGrid"></div>
+    </div>
+  </div>
+
   <div class="card">
     <h2>Console</h2>
     <textarea id="console" readonly></textarea>
@@ -318,6 +361,7 @@ let LIF_LEAK = 0.90;
 let LIF_THRESHOLD = 0.50;
 let SNN_TRACE_LEAK = 0.95;
 let CLIP_FRAME_INTERVAL_MS = 80; // gap between real frames within one clip
+let CLIP_COUNTDOWN_SEC = 2;      // 'get ready' countdown before each clip (0 = none)
 
 const ANN_WEIGHT_FILE = 'myWeights.bin';
 const SNN_WEIGHT_FILE = 'mySnnWeights.bin';
@@ -585,7 +629,7 @@ const Store = {
 async function saveConfig(){
   const cfg = { classes: CLASSES.map(c=>c.label), inputSize: INPUT_SIZE, numChannels: NUM_CHANNELS,
                 snnTimesteps: SNN_TIMESTEPS, lifLeak: LIF_LEAK, lifThreshold: LIF_THRESHOLD, snnTraceLeak: SNN_TRACE_LEAK,
-                clipFrameIntervalMs: CLIP_FRAME_INTERVAL_MS };
+                clipFrameIntervalMs: CLIP_FRAME_INTERVAL_MS, clipCountdownSec: CLIP_COUNTDOWN_SEC };
   await Store.writeWeightFile(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
 async function loadConfig(){
@@ -601,6 +645,7 @@ async function loadConfig(){
     if (cfg.lifThreshold!==undefined) LIF_THRESHOLD = cfg.lifThreshold;
     if (cfg.snnTraceLeak!==undefined) SNN_TRACE_LEAK = cfg.snnTraceLeak;
     if (cfg.clipFrameIntervalMs!==undefined) CLIP_FRAME_INTERVAL_MS = cfg.clipFrameIntervalMs;
+    if (cfg.clipCountdownSec!==undefined) CLIP_COUNTDOWN_SEC = cfg.clipCountdownSec;
     return true;
   } catch(e){ return false; }
 }
@@ -795,17 +840,48 @@ function setRecordingIndicator(on){
   const el = document.getElementById('recIndicator');
   if (el) el.classList.toggle('hidden', !on);
 }
+// Camera-overlay states: 'countdown' (yellow, big number), 'recording'
+// (red border, REC n/N, progress bar), 'done' (green, "saved"), or null.
+function setRecOverlay(state, o={}){
+  const ov = document.getElementById('recOverlay');
+  ov.classList.remove('countdown','recording','done');
+  if (!state){ ov.classList.add('hidden'); return; }
+  ov.classList.remove('hidden'); ov.classList.add(state);
+  document.getElementById('recBadge').textContent = o.badge || '';
+  document.getElementById('recCount').textContent = o.big || '';
+  document.getElementById('recBarFill').style.width = (o.pct||0)+'%';
+}
+// Frames are scheduled against the clip's start time (frame i at
+// i*intervalMs) instead of "capture, then sleep", so the time a capture
+// itself takes doesn't stretch the spacing. If a capture takes longer than
+// the interval the spacing can't go below that, and we say so.
+let _recHideTimer = null;
 async function captureClipJpegs(count, intervalMs){
+  clearTimeout(_recHideTimer);
   setRecordingIndicator(true);
   try {
-    const frames = [];
-    for (let i=0;i<count;i++){
-      frames.push(await captureSquareJpeg());
-      if (i<count-1) await sleep(intervalMs);
+    for (let n=CLIP_COUNTDOWN_SEC; n>0; n--){
+      setRecOverlay('countdown', { badge:'GET READY', big:String(n) });
+      await sleep(1000);
     }
+    const frames = [];
+    const start = performance.now();
+    for (let i=0;i<count;i++){
+      const wait = start + i*intervalMs - performance.now();
+      if (wait>0) await sleep(wait);
+      setRecOverlay('recording', { badge:`\u25cf REC ${i+1}/${count}`, pct: (i+1)/count*100 });
+      frames.push(await captureSquareJpeg());
+    }
+    const total = performance.now()-start;
+    const ideal = (count-1)*intervalMs;
+    log(`[Collect] Clip took ${total.toFixed(0)}ms for ${count} frames (target ${ideal}ms, ~${(total/Math.max(1,count-1)).toFixed(0)}ms per frame).`
+        + (total > ideal*1.25 ? ' Capture is slower than the interval - raise the interval or lower the resolution.' : ''));
+    setRecOverlay('done', { badge:'\u2713 CLIP SAVED', pct:100 });
+    _recHideTimer = setTimeout(()=>setRecOverlay(null), 700);
     return frames;
   } finally {
     setRecordingIndicator(false);
+    if (!document.getElementById('recOverlay').classList.contains('done')) setRecOverlay(null);
   }
 }
 function fillInputBufferFromImageData(imgData, buf){
@@ -1383,9 +1459,36 @@ async function refreshGallery(){
       await refreshCollectCount(); // also re-runs refreshGallery since the grid is visible
       buildClassList();
     };
-    item.appendChild(img); item.appendChild(cap); item.appendChild(del);
+    const view = document.createElement('button'); view.className = 'view'; view.textContent = '\u2922';
+    view.title = 'View all frames (or double-click the thumbnail)';
+    view.onclick = (e)=>{ e.stopPropagation(); openClipViewer(clip); };
+    item.ondblclick = ()=>openClipViewer(clip);
+    item.appendChild(img); item.appendChild(cap); item.appendChild(view); item.appendChild(del);
     grid.appendChild(item);
   }
+}
+// Full-screen viewer: every frame of one clip, in order. Delete removes the
+// whole clip (a clip missing frames would no longer match SNN_TIMESTEPS).
+let _viewerUrls = [], _viewerClip = null;
+function openClipViewer(clip){
+  closeClipViewer();
+  _viewerClip = clip;
+  document.getElementById('viewerTitle').textContent =
+    `${CLASSES[collectClassIdx].label} - ${clip.frames.length} frame${clip.frames.length>1?'s':''}`;
+  const grid = document.getElementById('viewerGrid'); grid.innerHTML = '';
+  clip.frames.forEach((blob, i)=>{
+    const url = URL.createObjectURL(blob); _viewerUrls.push(url);
+    const fig = document.createElement('figure');
+    const img = document.createElement('img'); img.src = url; img.alt = 'frame '+i;
+    const cap = document.createElement('figcaption'); cap.textContent = 'f'+String(i).padStart(2,'0');
+    fig.appendChild(img); fig.appendChild(cap); grid.appendChild(fig);
+  });
+  document.getElementById('clipViewer').classList.remove('hidden');
+}
+function closeClipViewer(){
+  document.getElementById('clipViewer').classList.add('hidden');
+  for (const u of _viewerUrls) URL.revokeObjectURL(u);
+  _viewerUrls = []; _viewerClip = null;
 }
 function toggleGallery(){
   const grid = document.getElementById('galleryGrid');
@@ -1627,8 +1730,9 @@ async function actionInferSnn(){
     showPrediction(denseOutputSnn);
     renderHeatmap(computeSnnHeatmap());
     frameCount++;
-    if (verboseInfer) log(`[SNN] #${frameCount} ${(performance.now()-t0).toFixed(0)}ms probs: `+Array.from(denseOutputSnn).map((p,i)=>`${CLASSES[i].label}=${(p*100).toFixed(0)}%`).join(' '));
-    await sleep(CLIP_FRAME_INTERVAL_MS);
+    if (verboseInfer) log(`[SNN] #${frameCount} ${(performance.now()-t0).toFixed(0)}ms (trained at ${CLIP_FRAME_INTERVAL_MS}ms/frame; a slower tick stretches real spacing) probs: `+Array.from(denseOutputSnn).map((p,i)=>`${CLASSES[i].label}=${(p*100).toFixed(0)}%`).join(' '));
+    // Pace to the trained frame interval, counting this tick's own time.
+    await sleep(Math.max(0, CLIP_FRAME_INTERVAL_MS - (performance.now()-t0)));
   }
   log(`[SNN] Exiting after ${frameCount} frames.`);
 }
@@ -1657,6 +1761,7 @@ function updateDeviceSettingsPanel(){
     `SNN timesteps / frames per clip: ${SNN_TIMESTEPS}`,
     `LIF leak: ${LIF_LEAK}   LIF threshold: ${LIF_THRESHOLD}   Trace leak: ${SNN_TRACE_LEAK}`,
     `Clip frame interval: ${CLIP_FRAME_INTERVAL_MS}ms`,
+    `Countdown before clip: ${CLIP_COUNTDOWN_SEC}s`,
     ``,
     `This is exactly what's written to header/config.json - make sure that file`,
     `(plus header/myWeights.bin, header/mySnnWeights.bin, and images/ if you want`,
@@ -1746,6 +1851,7 @@ function buildSettingsUI(){
     ['SNN LIF leak', ()=>LIF_LEAK, v=>{ LIF_LEAK=v; updateDeviceSettingsPanel(); }, 0.01],
     ['SNN LIF threshold', ()=>LIF_THRESHOLD, v=>{ LIF_THRESHOLD=v; updateDeviceSettingsPanel(); }, 0.01],
     ['SNN trace leak', ()=>SNN_TRACE_LEAK, v=>{ SNN_TRACE_LEAK=v; updateDeviceSettingsPanel(); }, 0.01],
+    ['Countdown before clip (s)', ()=>CLIP_COUNTDOWN_SEC, v=>{ CLIP_COUNTDOWN_SEC=Math.max(0,Math.round(v)); updateDeviceSettingsPanel(); saveConfig(); }, 1],
     ['Clip frame interval (ms)', ()=>CLIP_FRAME_INTERVAL_MS, v=>{ CLIP_FRAME_INTERVAL_MS=Math.round(v); updateDeviceSettingsPanel(); saveConfig(); }, 5],
   ];
   const grid = document.getElementById('settingsGrid');
@@ -1775,6 +1881,18 @@ function wireUI(){
   document.getElementById('fileImportImages').onchange = async (e)=>{ if (e.target.files.length){ setBusy(true); await importImageFilesForClass(collectClassIdx, Array.from(e.target.files)); setBusy(false); e.target.value=''; } };
   document.getElementById('btnDeleteClass').onclick = async ()=>{ setBusy(true); await deleteCurrentClass(); setBusy(false); };
   document.getElementById('btnToggleGallery').onclick = toggleGallery;
+  document.getElementById('btnViewerClose').onclick = closeClipViewer;
+  document.getElementById('clipViewer').onclick = (e)=>{ if (e.target.id==='clipViewer') closeClipViewer(); };
+  document.addEventListener('keydown', e=>{ if (e.key==='Escape') closeClipViewer(); });
+  document.getElementById('btnViewerDelete').onclick = async ()=>{
+    const clip = _viewerClip; if (!clip) return;
+    if (!confirm(`Delete this whole clip (${clip.frames.length} frames)? This can't be undone.`)) return;
+    closeClipViewer();
+    await Store.deleteClip(collectClassIdx, clip.name);
+    log(`[Gallery] Deleted clip '${clip.name}' from '${CLASSES[collectClassIdx].label}'.`);
+    await refreshCollectCount();
+    buildClassList();
+  };
   document.getElementById('btnCloseCollect').onclick = ()=>{
     document.getElementById('collectPanel').classList.add('hidden');
     document.getElementById('galleryGrid').classList.add('hidden');
