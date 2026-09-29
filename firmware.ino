@@ -51,6 +51,13 @@
 //    different assumptions about what changes between timesteps. Don't mix
 //    them.
 //
+// COLLECTING A CLIP: optional countdown (clipCountdownSec, OLED "3 2 1" +
+//    Serial), then "REC" while frames are captured into PSRAM exactly
+//    clipFrameIntervalMs apart (measured and printed), then "SAVE" while they
+//    are written to the SD card. clipFrameIntervalMs is the delay between
+//    timesteps: raise it to stretch the same 16 frames over a longer movement.
+//    The camera is flipped vertically (CAMERA_VFLIP) to match the browser webcam.
+//
 // SD card stores: images/<folder>/clip_<id>/f00.jpg.. (this firmware or the
 //                 browser can write these; loose <folder>/img_*.jpg from
 //                 v002 still count as 1-frame clips)
@@ -124,6 +131,7 @@ float LIF_LEAK = 0.90f;
 float LIF_THRESHOLD = 0.50f;
 float SNN_TRACE_LEAK = 0.95f;
 int CLIP_FRAME_INTERVAL_MS = 80;
+int CLIP_COUNTDOWN_SEC = 2;   // 'get ready' countdown before each collected clip (0 = none)
 
 const int myThresholdPress = 1100;
 const int myThresholdRelease = 900;
@@ -168,6 +176,13 @@ bool mySnnTrained = false;   // true once mySnnWeights.bin loaded successfully
 #define VSYNC_GPIO_NUM 38
 #define HREF_GPIO_NUM  47
 #define PCLK_GPIO_NUM  13
+// CAMERA ORIENTATION - applied on the sensor itself, so saved clips, the OLED
+// preview and inference all see the same image. The XIAO camera came out upside
+// down relative to the browser webcam, so it is flipped vertically. Set either
+// to 0 to undo it. Clips collected on the device BEFORE changing these keep
+// their old orientation - recollect or delete them, don't mix.
+#define CAMERA_VFLIP 1
+#define CAMERA_HMIRROR 1
 #define CAPTURE_SIZE 240   // camera always captures square 240x240 JPEGs regardless of INPUT_SIZE
 
 // ======================================================
@@ -319,7 +334,7 @@ void myApplyFallbackConfig() {
   NUM_CLASSES = myClassLabels.size(); myTotalItems = NUM_CLASSES + 2;
   INPUT_SIZE = 64; NUM_CHANNELS = 3;
   SNN_TIMESTEPS = 16; LIF_LEAK = 0.90f; LIF_THRESHOLD = 0.50f; SNN_TRACE_LEAK = 0.95f;
-  CLIP_FRAME_INTERVAL_MS = 80;
+  CLIP_FRAME_INTERVAL_MS = 80; CLIP_COUNTDOWN_SEC = 2;
   Serial.println("No " CONFIG_PATH " found - using the built-in default config (1Unknown, 2MovingHand, 3MovingFace).");
 }
 // Writes the default config to the SD card as a real config.json the first
@@ -334,8 +349,8 @@ void myWriteDefaultConfigIfMissing() {
   f.print("{\n  \"classes\": [");
   for (int i = 0; i < NUM_CLASSES; i++) { f.print(i ? ", " : ""); f.print("\"" + myClassLabels[i] + "\""); }
   f.printf("],\n  \"inputSize\": %d,\n  \"numChannels\": %d,\n  \"snnTimesteps\": %d,\n", INPUT_SIZE, NUM_CHANNELS, SNN_TIMESTEPS);
-  f.printf("  \"lifLeak\": %.2f,\n  \"lifThreshold\": %.2f,\n  \"snnTraceLeak\": %.2f,\n  \"clipFrameIntervalMs\": %d\n}\n",
-           LIF_LEAK, LIF_THRESHOLD, SNN_TRACE_LEAK, CLIP_FRAME_INTERVAL_MS);
+  f.printf("  \"lifLeak\": %.2f,\n  \"lifThreshold\": %.2f,\n  \"snnTraceLeak\": %.2f,\n  \"clipFrameIntervalMs\": %d,\n  \"clipCountdownSec\": %d\n}\n",
+           LIF_LEAK, LIF_THRESHOLD, SNN_TRACE_LEAK, CLIP_FRAME_INTERVAL_MS, CLIP_COUNTDOWN_SEC);
   f.close();
   Serial.println("Wrote default " CONFIG_PATH " to the SD card - edit it or replace it with the browser's export.");
 }
@@ -359,6 +374,7 @@ bool myLoadConfig() {
   if (myJsonGetInt(json, "numChannels", iv)) NUM_CHANNELS = iv;
   if (myJsonGetInt(json, "snnTimesteps", iv)) SNN_TIMESTEPS = iv;
   if (myJsonGetInt(json, "clipFrameIntervalMs", iv)) CLIP_FRAME_INTERVAL_MS = iv;
+  if (myJsonGetInt(json, "clipCountdownSec", iv)) CLIP_COUNTDOWN_SEC = iv;
   float fv;
   if (myJsonGetFloat(json, "lifLeak", fv)) LIF_LEAK = fv;
   if (myJsonGetFloat(json, "lifThreshold", fv)) LIF_THRESHOLD = fv;
@@ -579,7 +595,7 @@ void setup() {
   Serial.println("Camera initialized");
 
   sensor_t* s = esp_camera_sensor_get();
-  if (s != NULL) s->set_hmirror(s, 1);
+  if (s != NULL) { s->set_hmirror(s, CAMERA_HMIRROR); s->set_vflip(s, CAMERA_VFLIP); }
 
   esp_log_level_set("*", ESP_LOG_WARN);
   esp_log_level_set("esp_camera", ESP_LOG_ERROR);
@@ -688,22 +704,63 @@ int myCountClips(const String &classPath) {
   return n;
 }
 
-// Records one clip: SNN_TIMESTEPS real, sequential JPEG frames,
-// CLIP_FRAME_INTERVAL_MS apart, into a fresh clip_<millis> subfolder.
+// Big word + small caption on the little OLED, for the countdown / REC / save phases.
+void myOledBanner(const char* big, const char* small) {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_ncenB10_tr); u8g2.drawStr(4, 22, big);
+    u8g2.setFont(u8g2_font_5x7_tf);     u8g2.drawStr(0, 38, small);
+  } while (u8g2.nextPage());
+}
+
+// Records one clip in three clearly separated phases:
+//  1) optional "get ready" countdown (CLIP_COUNTDOWN_SEC) on OLED + Serial
+//  2) RECORD: SNN_TIMESTEPS real frames, scheduled CLIP_FRAME_INTERVAL_MS apart
+//     from the clip's start, kept in PSRAM - so slow SD writes can't stretch
+//     the spacing, and the spacing matches what inference paces itself to
+//  3) SAVE: write them to images/<folder>/clip_<id>/fNN.jpg on the SD card
 void myCaptureClip(const String &classPath, int clipDisplayNumber) {
-  String clipPath = classPath + "/clip_" + String(millis());
-  SD.mkdir(clipPath);
-  Serial.printf("  Recording clip (%d frames, %dms apart)...\n", SNN_TIMESTEPS, CLIP_FRAME_INTERVAL_MS);
+  for (int n = CLIP_COUNTDOWN_SEC; n > 0; n--) {
+    char b[8]; snprintf(b, sizeof(b), "%d", n);
+    myOledBanner(b, "GET READY");
+    Serial.printf("  %d...\n", n);
+    delay(1000);
+  }
+  uint8_t** bufs = (uint8_t**)calloc(SNN_TIMESTEPS, sizeof(uint8_t*));
+  size_t* lens = (size_t*)calloc(SNN_TIMESTEPS, sizeof(size_t));
+  if (!bufs || !lens) { Serial.println("  out of memory for clip"); free(bufs); free(lens); return; }
+
+  myOledBanner("REC", "recording");
+  Serial.printf("  >>> RECORDING %d frames, %dms apart <<<\n", SNN_TIMESTEPS, CLIP_FRAME_INTERVAL_MS);
+  int got = 0;
+  unsigned long start = millis();
   for (int i = 0; i < SNN_TIMESTEPS; i++) {
+    long wait = (long)((start + (unsigned long)i * CLIP_FRAME_INTERVAL_MS) - millis());
+    if (wait > 0) delay(wait);
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) { Serial.println("  frame grab failed mid-clip"); continue; }
-    char fname[16]; snprintf(fname, sizeof(fname), "/f%02d.jpg", i); // was char fname[8] - too small for "/fNN.jpg\0" (9 bytes), truncated to "/fNN.jp"
-    File file = SD.open(clipPath + String(fname), FILE_WRITE);
-    if (file) { file.write(fb->buf, fb->len); file.close(); }
-    if (i == SNN_TIMESTEPS - 1) myDisplayImageOnOLED(fb, clipDisplayNumber);
+    uint8_t* copy = (uint8_t*)ps_malloc(fb->len);
+    if (copy) { memcpy(copy, fb->buf, fb->len); bufs[got] = copy; lens[got] = fb->len; got++; }
+    else Serial.println("  PSRAM full - frame dropped");
     esp_camera_fb_return(fb);
-    if (i < SNN_TIMESTEPS - 1) delay(CLIP_FRAME_INTERVAL_MS);
   }
+  unsigned long total = millis() - start;
+  unsigned long ideal = (unsigned long)(SNN_TIMESTEPS - 1) * CLIP_FRAME_INTERVAL_MS;
+  Serial.printf("  <<< DONE recording: %lums for %d frames (target %lums)%s\n", total, got, ideal,
+                total > ideal + ideal / 4 ? "  - camera slower than the interval; raise clipFrameIntervalMs" : "");
+
+  myOledBanner("SAVE", "writing SD");
+  String clipPath = classPath + "/clip_" + String(millis());
+  SD.mkdir(clipPath);
+  for (int i = 0; i < got; i++) {
+    char fname[16]; snprintf(fname, sizeof(fname), "/f%02d.jpg", i); // 16 bytes: "/fNN.jpg\0" needs 9 (8 truncated it to ".jp")
+    File file = SD.open(clipPath + String(fname), FILE_WRITE);
+    if (file) { file.write(bufs[i], lens[i]); file.close(); }
+  }
+  if (got > 0 && myRgbBuffer && fmt2rgb888(bufs[got-1], lens[got-1], PIXFORMAT_JPEG, myRgbBuffer)) myRenderRgbToOLED(clipDisplayNumber);
+  for (int i = 0; i < got; i++) free(bufs[i]);
+  free(bufs); free(lens);
+  Serial.printf("  Saved %d frames to %s\n", got, clipPath.c_str());
 }
 
 void myActionCollect(int classIdx) {
@@ -1042,6 +1099,7 @@ void myActionInferSnn() {
   myResetTouchState();
   mySnnWindowFilled = 0; mySnnWindowNext = 0; // start the window fresh each time inference mode is entered
   int frameCount = 0, tick = 0;
+  unsigned long prevCapStart = 0; bool warnedSpacing = false;
   while (true) {
     if (Serial.available()) {
       char c = Serial.read();
@@ -1049,6 +1107,8 @@ void myActionInferSnn() {
       if (c=='v'||c=='V') { mySnnVerbose = !mySnnVerbose; Serial.printf("    Verbose %s\n", mySnnVerbose ? "ON" : "OFF"); }
     }
     unsigned long t0 = millis();
+    unsigned long period = prevCapStart ? t0 - prevCapStart : 0; // real spacing between the last two frames
+    prevCapStart = t0;
     bool ok = myCaptureAndPreprocess(mySnnWindow[mySnnWindowNext]);
     unsigned long capMs = millis() - t0;
     if (ok) {
@@ -1061,8 +1121,15 @@ void myActionInferSnn() {
       mySnnForwardInfer();
       unsigned long infMs = millis() - t1;
       myShowInferenceResult("SNN", mySnnDense_output, millis()-t0);
-      if (mySnnVerbose) Serial.printf("    capture=%lums inference=%lums total=%lums%s\n", capMs, infMs, millis()-t0,
-                                      mySnnWindowFilled < SNN_TIMESTEPS ? "  (window still filling)" : "");
+      if (mySnnVerbose) Serial.printf("    capture=%lums inference=%lums total=%lums frame spacing=%lums (trained at %dms)%s\n", capMs, infMs, millis()-t0,
+                                      period, CLIP_FRAME_INTERVAL_MS, mySnnWindowFilled < SNN_TIMESTEPS ? "  (window still filling)" : "");
+      // Frames the model sees here should be spaced like the clips it trained on.
+      if (!warnedSpacing && mySnnWindowFilled >= SNN_TIMESTEPS && period > (unsigned long)CLIP_FRAME_INTERVAL_MS * 5 / 4) {
+        warnedSpacing = true;
+        Serial.printf("    NOTE: real frame spacing here (%lums) is slower than the trained %dms, so motion per timestep is larger than in training.\n"
+                      "          Fix: collect+train with clipFrameIntervalMs >= ~%lu, or lower INPUT_SIZE/SNN_TIMESTEPS to speed up each tick.\n",
+                      period, CLIP_FRAME_INTERVAL_MS, period);
+      }
     }
     frameCount++;
     if (frameCount >= 5) {
